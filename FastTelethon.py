@@ -301,7 +301,7 @@ async def download_file(client: TelegramClient,
     dc_id, location = utils.get_input_location(location)
     # Lock per account: Telegram limits concurrent connections, so one parallel
     # transfer at a time per client avoids "server closed the connection" errors.
-    async with parallel_transfer_locks[id(client)]:
+    async with parallel_transfer_locks[("dl", id(client))]:
         downloader = ParallelTransferrer(client, dc_id)
         downloaded = downloader.download(location, size)
         async for x in downloaded:
@@ -319,7 +319,7 @@ async def upload_file(client: TelegramClient,
 
                       ) -> TypeInputFile:
     # Lock per account to stay within Telegram's connection limits
-    async with parallel_transfer_locks[id(client)]:
+    async with parallel_transfer_locks[("ul", id(client))]:
         res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
     return res
 

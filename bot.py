@@ -111,7 +111,8 @@ class UserSession:
             cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
             rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
             name="", total=0, total_msgs=0, key="", last_result="", delay=DELAY,
-            force_dl=False, phase_detail="", cur_cur=0, cur_tot=0, cur_speed=0.0,
+            force_dl=False,
+            dl_cur=0, dl_tot=0, dl_speed=0.0, ul_cur=0, ul_tot=0, ul_speed=0.0,
         )
 
 
@@ -589,14 +590,15 @@ def render_job():
         else:
             lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
-        # live per-file transfer (download/upload) progress — this is the accurate speed
-        if job["phase_detail"] and job["cur_tot"]:
-            p = job["cur_cur"] / job["cur_tot"] * 100
-            icon = "⬇️ Downloading" if job["phase_detail"] == "downloading" else "⬆️ Uploading"
-            lines.append(f"{icon}: {p:.1f}% ({fmt_size(job['cur_cur'])} / {fmt_size(job['cur_tot'])})")
-            if job["cur_speed"] > 0:
-                eta_f = (job["cur_tot"] - job["cur_cur"]) / job["cur_speed"]
-                lines.append(f"⚡ {fmt_size(job['cur_speed'])}/s • this file ~{fmt_duration(eta_f)} left")
+        # live transfer progress — download (of the next file) and upload (of the current) run together
+        if job["dl_tot"]:
+            p = job["dl_cur"] / job["dl_tot"] * 100
+            sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
+            lines.append(f"⬇️ Downloading: {p:.1f}% ({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job["ul_tot"]:
+            p = job["ul_cur"] / job["ul_tot"] * 100
+            sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
+            lines.append(f"⬆️ Uploading: {p:.1f}% ({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
         if job["force_dl"]:
             # download/upload mode: the per-file speed above is the real one; show total moved
             if job["bytes_done"]:
@@ -690,36 +692,41 @@ async def try_src_thumb(m):
         return None
 
 
-async def send_item(dst, msgs, opts):
-    """Sends one message (or one album). Returns True if something was sent."""
-    client = S().client
-    rules = opts["rules"]
-    scope = opts["scope"]
-    link_rules = opts["link_rules"]
-    thumb = opts["thumb"]
-    footer = opts["footer"]
+def xfer_cb(prefix):
+    """Progress callback that updates job['dl_*'] or job['ul_*'] with live bytes and speed."""
     job = S().job
+    st = {"t": time.time(), "b": 0}
 
-    def cb_factory(kind):
-        st = {"t": time.time(), "b": 0}
+    def cb(cur, tot):
+        now = time.time()
+        job[prefix + "_cur"] = cur
+        job[prefix + "_tot"] = tot or 0
+        dt = now - st["t"]
+        if dt >= 0.5:
+            job[prefix + "_speed"] = max(0.0, cur - st["b"]) / dt
+            st["t"] = now
+            st["b"] = cur
+    return cb
 
-        def cb(cur, tot):
-            now = time.time()
-            job["phase_detail"] = kind
-            job["cur_cur"] = cur
-            job["cur_tot"] = tot or 0
-            dt = now - st["t"]
-            if dt >= 0.5:
-                job["cur_speed"] = max(0.0, cur - st["b"]) / dt
-                st["t"] = now
-                st["b"] = cur
-        return cb
 
+def reset_dir(prefix):
+    job = S().job
+    job[prefix + "_cur"] = 0
+    job[prefix + "_tot"] = 0
+    job[prefix + "_speed"] = 0.0
+
+
+async def wait_flood(e):
+    job = S().job
+    job["flood_until"] = time.time() + e.seconds + 1
+    await asyncio.sleep(e.seconds + 1)
+    job["flood_until"] = 0.0
+
+
+def make_captioner(opts):
+    rules, scope = opts["rules"], opts["scope"]
+    link_rules, footer = opts["link_rules"], opts["footer"]
     do_text = bool(rules) and scope in ("both", "text")
-    do_names = bool(rules) and scope in ("both", "names")
-
-    media_msgs = [m for m in msgs
-                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
 
     def caption_of(m, add_foot):
         raw = m.raw_text or ""
@@ -731,13 +738,57 @@ async def send_item(dst, msgs, opts):
         if add_foot:
             raw, ents = apply_footer(raw, ents, footer)
         return raw, ents
+    return caption_of
+
+
+async def download_one(client, m, tmp, idx, names, dcb):
+    sub = os.path.join(tmp, str(idx))
+    os.makedirs(sub, exist_ok=True)
+    size = getattr(getattr(m, "file", None), "size", None) or 0
+    if fast_download is not None and is_doc(m) and size >= FAST_MIN:
+        try:
+            fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
+            path = os.path.join(sub, fname)
+            with open(path, "wb") as out:
+                await fast_download(client, m.document, out, progress_callback=dcb)
+            return path
+        except FloodWaitError:
+            raise
+        except Exception:
+            pass  # fall back to the normal download
+    if m.id in names:
+        return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
+    return await m.download_media(file=sub + os.sep, progress_callback=dcb)
+
+
+async def wait_for_disk(needed):
+    """Block until there's room for `needed` bytes (+margin), so temp files never fill the disk."""
+    job = S().job
+    base = tempfile.gettempdir()
+    margin = 300 * 1024 * 1024
+    while not job["stop"]:
+        try:
+            if shutil.disk_usage(base).free > needed + margin:
+                return
+        except Exception:
+            return
+        await asyncio.sleep(1)
+
+
+async def prepare_group(group, opts):
+    """Downloads whatever must be re-uploaded (nothing for a direct server-side copy).
+    Runs ahead of sending so the next file downloads while the current one uploads."""
+    client = S().client
+    job = S().job
+    rules, scope, thumb = opts["rules"], opts["scope"], opts["thumb"]
+    do_names = bool(rules) and scope in ("both", "names")
+    caption_of = make_captioner(opts)
+    media_msgs = [m for m in group
+                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
 
     if not media_msgs:
-        raw, ents = caption_of(msgs[0], True)
-        if raw.strip():
-            await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
-            return True
-        return False
+        return {"media_msgs": [], "caps": [caption_of(group[0], True)], "files": None,
+                "names": {}, "reupload": set(), "tmp": None, "text_only": True}
 
     caps = [caption_of(m, i == 0) for i, m in enumerate(media_msgs)]
     names = {}
@@ -748,128 +799,121 @@ async def send_item(dst, msgs, opts):
                 new = rename_file(old, rules)
                 if new != old:
                     names[m.id] = new
-
-    # a file must be re-uploaded (download then upload) if it is renamed,
-    # if a custom thumbnail should be attached, or if the source restricts saving
-    # (private/protected channels) — in that case skip the pointless direct attempt.
     if job.get("force_dl"):
         reupload = {m.id for m in media_msgs}
     else:
-        reupload = {m.id for m in media_msgs
-                    if m.id in names or (thumb and is_doc(m))}
-
-    async def upload(files, streaming):
-        extra = {"supports_streaming": True} if streaming else {}
-        if len(files) == 1:
-            raw, ents = caps[0]
-            m0 = media_msgs[0]
-            f0 = files[0]
-            # pick a thumbnail: custom one if set, otherwise keep the source's own preview
-            own_thumb = None
-            thumb_file = None
-            if is_doc(m0) and isinstance(f0, str):
-                if thumb:
-                    thumb_file = thumb
-                else:
-                    own_thumb = await try_src_thumb(m0)
-                    thumb_file = own_thumb
-            thumb_kw = {"thumb": thumb_file} if thumb_file else {}
-            try:
-                # parallel multi-connection upload for large downloaded files (much faster)
-                if (fast_upload is not None and isinstance(f0, str)
-                        and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
-                    try:
-                        with open(f0, "rb") as fh:
-                            input_file = await fast_upload(client, fh, progress_callback=cb_factory("uploading"))
-                        attrs, mime = doc_attrs(m0, f0)
-                        await client.send_file(dst, input_file, caption=raw, attributes=attrs,
-                                               mime_type=mime, **ent_kw(ents), **thumb_kw)
-                        return
-                    except FloodWaitError:
-                        raise
-                    except Exception:
-                        pass  # fall back to the normal single-connection upload
-                await client.send_file(dst, f0, caption=raw,
-                                       progress_callback=cb_factory("uploading"),
-                                       **ent_kw(ents), **thumb_kw, **extra)
-            finally:
-                if own_thumb and os.path.exists(own_thumb):
-                    try:
-                        os.remove(own_thumb)
-                    except Exception:
-                        pass
-        else:
-            any_ents = any(e for _, e in caps)
-            if any_ents:
-                cap_list = [tl_markdown.unparse(r, e) if e else r for r, e in caps]
-                kw = {}
-            else:
-                cap_list = [r for r, _ in caps]
-                kw = {"parse_mode": None}
-            await client.send_file(dst, files, caption=cap_list,
-                                   progress_callback=cb_factory("uploading"), **kw, **extra)
+        reupload = {m.id for m in media_msgs if m.id in names or (thumb and is_doc(m))}
 
     tmp = None
-
-    async def download(i, m):
-        nonlocal tmp
-        if tmp is None:
-            tmp = tempfile.mkdtemp(prefix="cp_")
-        sub = os.path.join(tmp, str(i))
-        os.makedirs(sub, exist_ok=True)
-        dcb = cb_factory("downloading")
-        size = getattr(getattr(m, "file", None), "size", None) or 0
-        # parallel multi-connection download for large files
-        if fast_download is not None and is_doc(m) and size >= FAST_MIN:
+    if reupload:
+        needed = sum((getattr(getattr(m, "file", None), "size", None) or 0)
+                     for m in media_msgs if m.id in reupload)
+        await wait_for_disk(needed)
+        dcb = xfer_cb("dl")
+        while True:
             try:
-                fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
-                path = os.path.join(sub, fname)
-                with open(path, "wb") as out:
-                    await fast_download(client, m.document, out, progress_callback=dcb)
-                return path
-            except Exception:
-                pass  # fall back to the normal download
-        if m.id in names:
-            return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
-        return await m.download_media(file=sub + os.sep, progress_callback=dcb)
+                tmp = tmp or tempfile.mkdtemp(prefix="cp_")
+                files = []
+                for i, m in enumerate(media_msgs):
+                    files.append(await download_one(client, m, tmp, i, names, dcb)
+                                 if m.id in reupload else m.media)
+                break
+            except FloodWaitError as e:
+                await wait_flood(e)
+        reset_dir("dl")
+    else:
+        files = [m.media for m in media_msgs]
+    return {"media_msgs": media_msgs, "caps": caps, "files": files,
+            "names": names, "reupload": reupload, "tmp": tmp, "text_only": False}
 
-    try:
+
+async def do_upload(client, dst, prepared, opts):
+    media_msgs, caps, files = prepared["media_msgs"], prepared["caps"], prepared["files"]
+    thumb = opts["thumb"]
+    ucb = xfer_cb("ul")
+    if len(files) == 1:
+        raw, ents = caps[0]
+        m0, f0 = media_msgs[0], files[0]
+        own_thumb = None
+        thumb_file = None
+        if is_doc(m0) and isinstance(f0, str):
+            if thumb:
+                thumb_file = thumb
+            else:
+                own_thumb = await try_src_thumb(m0)
+                thumb_file = own_thumb
+        thumb_kw = {"thumb": thumb_file} if thumb_file else {}
         try:
-            files = []
-            for i, m in enumerate(media_msgs):
-                files.append(await download(i, m) if m.id in reupload else m.media)
-            await upload(files, streaming=bool(reupload))
-            return True
-        except FloodWaitError:
-            raise
-        except Exception:
-            # direct copy failed (often a protected/restricted source): download + re-upload,
-            # and remember it so later messages skip the wasted direct attempt
-            job["force_dl"] = True
-        files = [await download(i, m) for i, m in enumerate(media_msgs)]
-        await upload(files, streaming=True)
-        return True
-    finally:
-        job["phase_detail"] = ""
-        job["cur_cur"] = 0
-        job["cur_tot"] = 0
-        job["cur_speed"] = 0.0
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
+            if (fast_upload is not None and isinstance(f0, str)
+                    and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
+                try:
+                    with open(f0, "rb") as fh:
+                        input_file = await fast_upload(client, fh, progress_callback=ucb)
+                    attrs, mime = doc_attrs(m0, f0)
+                    await client.send_file(dst, input_file, caption=raw, attributes=attrs,
+                                           mime_type=mime, **ent_kw(ents), **thumb_kw)
+                    return
+                except FloodWaitError:
+                    raise
+                except Exception:
+                    pass  # fall back to the normal single-connection upload
+            extra = {"supports_streaming": True} if isinstance(f0, str) else {}
+            await client.send_file(dst, f0, caption=raw, progress_callback=ucb,
+                                   **ent_kw(ents), **thumb_kw, **extra)
+        finally:
+            if own_thumb and os.path.exists(own_thumb):
+                try:
+                    os.remove(own_thumb)
+                except Exception:
+                    pass
+    else:
+        streaming = any(isinstance(f, str) for f in files)
+        extra = {"supports_streaming": True} if streaming else {}
+        any_ents = any(e for _, e in caps)
+        if any_ents:
+            cap_list = [tl_markdown.unparse(r, e) if e else r for r, e in caps]
+            kw = {}
+        else:
+            cap_list = [r for r, _ in caps]
+            kw = {"parse_mode": None}
+        await client.send_file(dst, files, caption=cap_list, progress_callback=ucb, **kw, **extra)
 
 
-async def safe_send(dst, group, opts):
-    """Returns (sent: bool, error: Exception or None). Waits out FloodWait automatically."""
+async def send_group(dst, group, prepared, opts):
+    """Uploads/sends an already-prepared group. Returns (sent, error, extra_tmp_to_clean)."""
+    client = S().client
     job = S().job
-    while True:
-        try:
-            return await send_item(dst, group, opts), None
-        except FloodWaitError as e:
-            job["flood_until"] = time.time() + e.seconds + 1
-            await asyncio.sleep(e.seconds + 1)
-            job["flood_until"] = 0.0
-        except Exception as e:
-            return False, e
+    extra_tmp = None
+    try:
+        if prepared["text_only"]:
+            raw, ents = prepared["caps"][0]
+            if not raw.strip():
+                return False, None, None
+            while True:
+                try:
+                    await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
+                    return True, None, None
+                except FloodWaitError as e:
+                    await wait_flood(e)
+        while True:
+            try:
+                await do_upload(client, dst, prepared, opts)
+                return True, None, extra_tmp
+            except FloodWaitError as e:
+                await wait_flood(e)
+            except Exception as e:
+                # direct server-side copy failed (restricted source): download + re-upload once
+                if not prepared["reupload"] and not job.get("force_dl"):
+                    job["force_dl"] = True
+                    try:
+                        prepared = await prepare_group(group, opts)
+                        extra_tmp = prepared.get("tmp")
+                        continue
+                    except Exception as e2:
+                        return False, e2, extra_tmp
+                return False, e, extra_tmp
+    finally:
+        reset_dir("ul")
 
 
 def group_bytes(group):
@@ -892,14 +936,20 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     ticker_task = None
 
     async def progress_ticker():
-        # keeps /status live: file download/upload progress and the flood-wait countdown
+        # keeps /status live: download/upload progress and the flood-wait countdown
         try:
             while job["running"]:
-                force = job["flood_until"] > time.time() or bool(job["phase_detail"])
+                force = (job["flood_until"] > time.time()
+                         or job["dl_tot"] > 0 or job["ul_tot"] > 0)
                 await refresh(status, force=force)
                 await asyncio.sleep(2)
         except asyncio.CancelledError:
             pass
+
+    def clean_tmp(prepared):
+        t = prepared.get("tmp") if isinstance(prepared, dict) else None
+        if t:
+            shutil.rmtree(t, ignore_errors=True)
 
     try:
         src = await resolve(src_ref, "Source channel")
@@ -918,45 +968,80 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
 
-        group = []
+        # pipeline: a producer downloads the next group while the consumer uploads the current one
+        queue = asyncio.Queue(maxsize=1)
+        STOP = object()
 
-        async def flush():
-            nonlocal group
-            if not group:
-                return
-            sent, err = await safe_send(dst, group, opts)
-            last_id = group[-1].id
-            if err is not None:
-                job["failed"] += len(group)
-                record_error(f"message ID {last_id}", err)
-            elif sent:
-                job["done"] += len(group)
-                job["bytes_done"] += group_bytes(group)
-            else:
-                job["skipped"] += len(group)
-            job["cur_id"] = last_id
-            save_progress(job["key"], last_id)
+        async def producer():
             group = []
-            await asyncio.sleep(job["delay"])
-            await refresh(status)
 
-        async for m in client.iter_messages(src, reverse=True, min_id=min_id):
-            if job["stop"]:
-                break
-            if m.action:
-                continue
-            if m.grouped_id:
-                if group and group[0].grouped_id == m.grouped_id:
-                    group.append(m)
-                    continue
-                await flush()
-                group = [m]
-            else:
-                await flush()
-                group = [m]
-                await flush()
-        if not job["stop"]:
-            await flush()
+            async def enqueue(g):
+                try:
+                    prepared = await prepare_group(g, opts)
+                except Exception as e:
+                    prepared = {"__error__": e, "tmp": None}
+                await queue.put((g, prepared))
+
+            try:
+                async for m in client.iter_messages(src, reverse=True, min_id=min_id):
+                    if job["stop"]:
+                        break
+                    if m.action:
+                        continue
+                    if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                        group.append(m)
+                        continue
+                    if group:
+                        await enqueue(group)
+                    group = [m]
+                if group and not job["stop"]:
+                    await enqueue(group)
+            finally:
+                await queue.put(STOP)
+
+        prod = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is STOP:
+                    break
+                group, prepared = item
+                last_id = group[-1].id
+                if isinstance(prepared, dict) and "__error__" in prepared:
+                    job["failed"] += len(group)
+                    record_error(f"message ID {last_id}", prepared["__error__"])
+                else:
+                    sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+                    clean_tmp(prepared)
+                    if extra_tmp:
+                        shutil.rmtree(extra_tmp, ignore_errors=True)
+                    if err is not None:
+                        job["failed"] += len(group)
+                        record_error(f"message ID {last_id}", err)
+                    elif sent:
+                        job["done"] += len(group)
+                        job["bytes_done"] += group_bytes(group)
+                    else:
+                        job["skipped"] += len(group)
+                job["cur_id"] = last_id
+                save_progress(job["key"], last_id)
+                if job["stop"]:
+                    break
+                await asyncio.sleep(job["delay"])
+                await refresh(status)
+        finally:
+            prod.cancel()
+            try:
+                await prod
+            except BaseException:
+                pass
+            while not queue.empty():
+                try:
+                    it = queue.get_nowait()
+                except Exception:
+                    break
+                if isinstance(it, tuple):
+                    clean_tmp(it[1])
         job["phase"] = "stopped" if job["stop"] else "done"
     except BadInput as e:
         job["phase"] = "error"
@@ -972,6 +1057,8 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     finally:
         job["running"] = False
         job["flood_until"] = 0.0
+        job["dl_tot"] = job["dl_cur"] = job["ul_tot"] = job["ul_cur"] = 0
+        job["dl_speed"] = job["ul_speed"] = 0.0
         if ticker_task is not None:
             ticker_task.cancel()
         job["last_result"] = render_job()
