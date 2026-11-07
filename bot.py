@@ -31,9 +31,12 @@ from telethon.tl.types import (
 try:
     # parallel multi-connection transfer (much faster up/downloads for large files)
     from FastTelethon import upload_file as fast_upload, download_file as fast_download
-except Exception:
+    FAST_IMPORT_ERROR = None
+except Exception as _e:
+    # don't hide this: without it every transfer silently uses the slow single-connection path
     fast_upload = None
     fast_download = None
+    FAST_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 VERSION = "v10"
 
@@ -159,7 +162,7 @@ class UserSession:
             force_dl=False,
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
-            pending=None, paused=False, pending_id=0,
+            pending=None, paused=False, pending_id=0, fast_note="",
         )
 
 
@@ -651,6 +654,8 @@ def render_job():
             mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("dl_mode"), "")
             lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}{mode}: {p:.1f}% "
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job.get("fast_note"):
+            lines.append(f"⚠️ {job['fast_note']}")
         if job.get("paused") and job.get("pending_id"):
             lines.append(f"⏸ Paused — tap a button to retry/skip message ID {job['pending_id']} (nothing skipped yet)")
         if job["force_dl"]:
@@ -716,6 +721,17 @@ async def refresh(status, force=False):
 # ----------------------------- copy engine -----------------------------
 def ent_kw(ents):
     return {"formatting_entities": ents} if ents else {"parse_mode": None}
+
+
+def why_no_fast(enabled, fn, size):
+    """Plain reason the parallel path was skipped, so it shows up in /status."""
+    if not enabled:
+        return "disabled by env"
+    if fn is None:
+        return f"FastTelethon not loaded ({FAST_IMPORT_ERROR or 'file missing'})"
+    if size < FAST_MIN:
+        return f"file under {FAST_MIN // (1024 * 1024)} MB"
+    return "not a document"
 
 
 def is_doc(m):
@@ -892,12 +908,16 @@ async def download_one(client, m, tmp, idx, names, dcb):
             path = os.path.join(sub, fname)
             with open(path, "wb") as out:
                 await fast_download(client, m.document, out, progress_callback=dcb)
+            job["fast_note"] = ""
             return path
         except FloodWaitError:
             raise
         except Exception as e:
-            print(f"Fast download failed for message {m.id}: {type(e).__name__}: {e} "
-                  "-> using normal (slower) download", flush=True)
+            note = f"fast download failed: {type(e).__name__}: {e}"
+            job["fast_note"] = note[:160]
+            print(f"Message {m.id}: {note} -> using normal (slower) download", flush=True)
+    else:
+        job["fast_note"] = f"fast download off: {why_no_fast(USE_FAST_DL, fast_download, size)}"
     job["dl_mode"] = "normal"
     if m.id in names:
         return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
@@ -1033,18 +1053,19 @@ async def do_upload(client, dst, prepared, opts):
                     attrs, mime = doc_attrs(m0, f0)
                     await client.send_file(dst, input_file, caption=raw, attributes=attrs,
                                            mime_type=mime, **ent_kw(ents), **thumb_kw)
+                    job["fast_note"] = ""
                     return
                 except FloodWaitError:
                     raise
                 except Exception as e:
                     # fall back to the normal single-connection upload, and say so
-                    print(f"Fast upload failed for message {m0.id}: {type(e).__name__}: {e} "
-                          "-> using normal (slower) upload", flush=True)
+                    note = f"fast upload failed: {type(e).__name__}: {e}"
+                    job["fast_note"] = note[:160]
+                    print(f"Message {m0.id}: {note} -> using normal (slower) upload", flush=True)
             elif isinstance(f0, str) and is_doc(m0):
-                why = ("USE_FAST=0" if not USE_FAST else
-                       "FastTelethon.py missing" if fast_upload is None else
-                       f"file smaller than {FAST_MIN // (1024 * 1024)} MB")
-                print(f"Normal upload for message {m0.id} ({why})", flush=True)
+                size0 = os.path.getsize(f0)
+                job["fast_note"] = f"fast upload off: {why_no_fast(USE_FAST, fast_upload, size0)}"
+                print(f"Message {m0.id}: {job['fast_note']}", flush=True)
             job["ul_mode"] = "normal"
             extra = {"supports_streaming": True} if isinstance(f0, str) else {}
             await client.send_file(dst, f0, caption=raw, progress_callback=ucb,
@@ -2480,6 +2501,12 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("telethon").setLevel(logging.INFO)
     print(f"Channel Tools Assistant {VERSION}: starting up…", flush=True)
+    if FAST_IMPORT_ERROR:
+        print(f"WARNING: FastTelethon could not be loaded ({FAST_IMPORT_ERROR}). "
+              "Transfers will use the slow single-connection path.", flush=True)
+    else:
+        print(f"Parallel transfer ready (upload={USE_FAST}, download={USE_FAST_DL}, "
+              f"connections={os.environ.get('FT_CONNECTIONS', '8')}).", flush=True)
     # clear any leftover temp download files from a previous run so they don't fill the disk
     try:
         if DOWNLOAD_DIR and os.path.isdir(DOWNLOAD_DIR):
