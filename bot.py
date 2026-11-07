@@ -2491,4 +2491,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    bot.loop.run_until_complete(main())
+    try:
+        bot.loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Shutting down…", flush=True)        # normal stop, not a crash
+    finally:
+        try:
+            bot.loop.run_until_complete(bot.disconnect())
+        except Exception:
+            pass
