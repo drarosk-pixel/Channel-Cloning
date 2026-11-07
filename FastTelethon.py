@@ -81,9 +81,10 @@ class UploadSender:
 
     def __init__(self, client: TelegramClient, sender: MTProtoSender, file_id: int, part_count: int, big: bool,
                  index: int,
-                 stride: int, loop: asyncio.AbstractEventLoop) -> None:
+                 stride: int, loop: asyncio.AbstractEventLoop, on_done: callable = None) -> None:
         self.client = client
         self.sender = sender
+        self.on_done = on_done
         self.part_count = part_count
         if big:
             self.request = SaveBigFilePartRequest(file_id, index, part_count, b"")
@@ -104,6 +105,8 @@ class UploadSender:
                   f" with {len(data)} bytes")
         await self.client._call(self.sender, self.request)
         self.request.file_part += self.stride
+        if self.on_done:
+            self.on_done(len(data))   # count only parts Telegram has actually accepted
 
     async def disconnect(self) -> None:
         if self.previous:
@@ -127,6 +130,10 @@ class ParallelTransferrer:
                          else self.client.session.auth_key)
         self.senders = None
         self.upload_ticker = 0
+        self.sent_bytes = 0      # bytes confirmed by Telegram, for honest progress/speed
+
+    def _count_sent(self, n: int) -> None:
+        self.sent_bytes += n
 
     async def _cleanup(self) -> None:
         if not self.senders:
@@ -182,7 +189,7 @@ class ParallelTransferrer:
     async def _create_upload_sender(self, file_id: int, part_count: int, big: bool, index: int,
                                     stride: int) -> UploadSender:
         return UploadSender(self.client, await self._create_sender(), file_id, part_count, big, index, stride,
-                            loop=self.loop)
+                            loop=self.loop, on_done=self._count_sent)
 
     async def _create_sender(self) -> MTProtoSender:
         dc = await self.client._get_dc(self.dc_id)
@@ -267,7 +274,9 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
         # iterations per GB, which can slow uploads on a small VPS CPU)
         for data in stream_file(response, chunk_size=part_size):
             if progress_callback:
-                r = progress_callback(response.tell(), file_size)
+                # report bytes Telegram has confirmed, not bytes read from disk; reading runs
+                # ahead of the network, which made the reported upload speed jump around
+                r = progress_callback(min(uploader.sent_bytes, file_size), file_size)
                 if inspect.isawaitable(r):
                     await r
             if not is_large:
@@ -287,6 +296,11 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
         if len(buffer) > 0:
             await uploader.upload(bytes(buffer))
         await uploader.finish_upload()
+        if progress_callback:
+            # finish_upload waits for the last in-flight parts, so everything is confirmed now
+            r = progress_callback(file_size, file_size)
+            if inspect.isawaitable(r):
+                await r
     finally:
         # always release the parallel connections, even on error
         await uploader._cleanup()
