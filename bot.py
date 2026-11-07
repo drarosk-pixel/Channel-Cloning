@@ -66,12 +66,12 @@ FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use paral
 # ON by default; set USE_FAST=0 to disable. Harmless connection noise is suppressed below.
 USE_FAST = os.environ.get("USE_FAST", "1") == "1"
 # PIPELINE=1: download the next file while uploading the current one (uses both directions, ~2x).
-# PIPELINE=0: strictly one at a time (download, then upload). Connection warnings are silenced either way.
-PIPELINE = os.environ.get("PIPELINE", "1") == "1"
-# Parallel DOWNLOAD via FastTelethon is unstable when the source file lives in a different data center
-# (auth handshakes can stall). Plain download + cryptg is reliable and still fast, so it's the default.
-# Parallel UPLOAD (home DC) is stable and stays on via USE_FAST.
-USE_FAST_DL = os.environ.get("USE_FAST_DL", "0") == "1"
+# PIPELINE=0 (default): strictly one at a time (download, then upload). Fewer simultaneous
+# connections = more stable. Connection warnings are silenced either way.
+PIPELINE = os.environ.get("PIPELINE", "0") == "1"
+# Parallel DOWNLOAD via FastTelethon (on by default). With sequential mode (PIPELINE=0) only one
+# transfer runs at a time, so the connection count stays low and stays stable.
+USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
 
 
 # ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
