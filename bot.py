@@ -61,6 +61,13 @@ PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
+# Download temp files to the app's own (large, persistent) storage, NOT the system /tmp,
+# which is tiny on many hosts and causes "No space left on device" for big videos.
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", os.path.join(os.getcwd(), "dl_tmp"))
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+except Exception:
+    DOWNLOAD_DIR = None  # fall back to the system temp dir if we can't create it
 FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel transfer above this size
 # Parallel multi-connection transfer. Greatly speeds up uploads (single-connection uploads are slow).
 # ON by default; set USE_FAST=0 to disable. Harmless connection noise is suppressed below.
@@ -718,7 +725,7 @@ async def try_src_thumb(m):
     if not doc or not getattr(doc, "thumbs", None):
         return None
     try:
-        return await m.download_media(file=tempfile.mktemp(suffix=".jpg"), thumb=-1)
+        return await m.download_media(file=tempfile.mktemp(suffix=".jpg", dir=DOWNLOAD_DIR), thumb=-1)
     except Exception:
         return None
 
@@ -830,7 +837,7 @@ async def prepare_group(group, opts):
         dcb = xfer_cb("dl")
         while True:
             try:
-                tmp = tmp or tempfile.mkdtemp(prefix="cp_")
+                tmp = tmp or tempfile.mkdtemp(prefix="cp_", dir=DOWNLOAD_DIR)
                 files = []
                 for i, m in enumerate(media_msgs):
                     files.append(await download_one(client, m, tmp, i, names, dcb)
@@ -1573,7 +1580,7 @@ async def save_thumb_from(event):
     dst = os.path.join(THUMB_DIR, f"{sess.user_id}.jpg")
     tmpf = None
     try:
-        tmpf = await event.message.download_media(file=tempfile.mktemp(suffix=".img"))
+        tmpf = await event.message.download_media(file=tempfile.mktemp(suffix=".img", dir=DOWNLOAD_DIR))
         ok = normalize_thumb(tmpf, dst)
     except Exception:
         ok = False
@@ -2194,6 +2201,10 @@ def _quiet_exception_handler(loop, context):
 async def main():
     # hide Telethon's transient connection/auth warnings (they are retried automatically)
     logging.getLogger("telethon").setLevel(logging.ERROR)
+    # clear any leftover temp download files from a previous run so they don't fill the disk
+    if DOWNLOAD_DIR and os.path.isdir(DOWNLOAD_DIR):
+        for name in os.listdir(DOWNLOAD_DIR):
+            shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
     try:
         bot.loop.set_exception_handler(_quiet_exception_handler)
     except Exception:

@@ -3,6 +3,7 @@ sessions.json
 progress.json
 settings.json
 thumbs/
+dl_tmp/
 *.session
 *.session-journal
 
