@@ -43,6 +43,7 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `DOWNLOAD_DIR` | no | `./dl_tmp` | Where big files are downloaded temporarily. Keep it on large storage, not `/tmp` |
 | `USE_FAST` | no | `1` | Parallel multi-connection **upload** (fast uploads). Set `0` to disable |
 | `USE_FAST_DL` | no | `1` | Parallel **download** via FastTelethon. Set `0` for plain download |
+| `STALL_SECONDS` | no | `180` | Abort and retry a transfer if it makes no progress for this long (dead connection) |
 | `PIPELINE` | no | `0` | `1` = overlap download+upload (~2x, more connections). `0` = one at a time (stable) |
 | `FAST_UPLOAD_MB` | no | `5` | When `USE_FAST=1`, files larger than this use parallel transfer |
 | `FT_CONNECTIONS` | no | `8` | Parallel connections per transfer (lower = more stable on small hosts) |
