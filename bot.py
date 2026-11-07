@@ -7,6 +7,7 @@ import copy
 import shutil
 import struct
 import asyncio
+import logging
 import tempfile
 import contextvars
 from telethon import TelegramClient, events, Button
@@ -991,84 +992,54 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
 
-        # pipeline: a producer downloads the next group while the consumer uploads the current one
-        queue = asyncio.Queue(maxsize=1)
-        STOP = object()
+        # sequential: fully download a group, then fully upload it (one transfer at a time).
+        # This keeps the connection count low so FastTelethon stays stable (no auth/connection noise).
+        group = []
 
-        async def producer():
-            group = []
-            enq = [0]
-
-            async def enqueue(g):
-                job["dl_no"] = enq[0] + 1   # content number currently being downloaded
-                enq[0] += len(g)
-                try:
-                    prepared = await prepare_group(g, opts)
-                except Exception as e:
-                    prepared = {"__error__": e, "tmp": None}
-                await queue.put((g, prepared))
-
+        async def flush():
+            nonlocal group
+            if not group:
+                return
+            job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+            last_id = group[-1].id
             try:
-                async for m in client.iter_messages(src, reverse=True, min_id=min_id):
-                    if job["stop"]:
-                        break
-                    if m.action:
-                        continue
-                    if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
-                        group.append(m)
-                        continue
-                    if group:
-                        await enqueue(group)
-                    group = [m]
-                if group and not job["stop"]:
-                    await enqueue(group)
-            finally:
-                await queue.put(STOP)
-
-        prod = asyncio.create_task(producer())
-        try:
-            while True:
-                item = await queue.get()
-                if item is STOP:
-                    break
-                group, prepared = item
-                last_id = group[-1].id
-                if isinstance(prepared, dict) and "__error__" in prepared:
+                prepared = await prepare_group(group, opts)   # download step
+            except Exception as e:
+                prepared = {"__error__": e, "tmp": None}
+            if isinstance(prepared, dict) and "__error__" in prepared:
+                job["failed"] += len(group)
+                record_error(f"message ID {last_id}", prepared["__error__"])
+            else:
+                sent, err, extra_tmp = await send_group(dst, group, prepared, opts)   # upload step
+                clean_tmp(prepared)
+                if extra_tmp:
+                    shutil.rmtree(extra_tmp, ignore_errors=True)
+                if err is not None:
                     job["failed"] += len(group)
-                    record_error(f"message ID {last_id}", prepared["__error__"])
+                    record_error(f"message ID {last_id}", err)
+                elif sent:
+                    job["done"] += len(group)
+                    job["bytes_done"] += group_bytes(group)
                 else:
-                    job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1  # current content number
-                    sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
-                    clean_tmp(prepared)
-                    if extra_tmp:
-                        shutil.rmtree(extra_tmp, ignore_errors=True)
-                    if err is not None:
-                        job["failed"] += len(group)
-                        record_error(f"message ID {last_id}", err)
-                    elif sent:
-                        job["done"] += len(group)
-                        job["bytes_done"] += group_bytes(group)
-                    else:
-                        job["skipped"] += len(group)
-                job["cur_id"] = last_id
-                save_progress(job["key"], last_id)
-                if job["stop"]:
-                    break
-                await asyncio.sleep(job["delay"])
-                await refresh(status)
-        finally:
-            prod.cancel()
-            try:
-                await prod
-            except BaseException:
-                pass
-            while not queue.empty():
-                try:
-                    it = queue.get_nowait()
-                except Exception:
-                    break
-                if isinstance(it, tuple):
-                    clean_tmp(it[1])
+                    job["skipped"] += len(group)
+            job["cur_id"] = last_id
+            save_progress(job["key"], last_id)
+            group = []
+            await asyncio.sleep(job["delay"])
+            await refresh(status)
+
+        async for m in client.iter_messages(src, reverse=True, min_id=min_id):
+            if job["stop"]:
+                break
+            if m.action:
+                continue
+            if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                group.append(m)
+                continue
+            await flush()
+            group = [m]
+        if group and not job["stop"]:
+            await flush()
         job["phase"] = "stopped" if job["stop"] else "done"
     except BadInput as e:
         job["phase"] = "error"
@@ -2148,6 +2119,8 @@ def _quiet_exception_handler(loop, context):
 
 
 async def main():
+    # hide Telethon's transient connection/auth warnings (they are retried automatically)
+    logging.getLogger("telethon").setLevel(logging.ERROR)
     try:
         bot.loop.set_exception_handler(_quiet_exception_handler)
     except Exception:
