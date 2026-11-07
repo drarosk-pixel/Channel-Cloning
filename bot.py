@@ -60,7 +60,10 @@ PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
-FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel upload above this size
+FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel transfer above this size
+# Parallel multi-connection transfer only helps on high-bandwidth hosts/VPS. On bandwidth-limited
+# shared hosting it adds no speed but can cause connection warnings, so it's OFF by default.
+USE_FAST = os.environ.get("USE_FAST", "0") == "1"
 
 # `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
 # Each user logs in with /login; their own Telegram account then does the real work.
@@ -749,7 +752,7 @@ async def download_one(client, m, tmp, idx, names, dcb):
     sub = os.path.join(tmp, str(idx))
     os.makedirs(sub, exist_ok=True)
     size = getattr(getattr(m, "file", None), "size", None) or 0
-    if fast_download is not None and is_doc(m) and size >= FAST_MIN:
+    if USE_FAST and fast_download is not None and is_doc(m) and size >= FAST_MIN:
         try:
             fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
             path = os.path.join(sub, fname)
@@ -848,7 +851,7 @@ async def do_upload(client, dst, prepared, opts):
                 thumb_file = own_thumb
         thumb_kw = {"thumb": thumb_file} if thumb_file else {}
         try:
-            if (fast_upload is not None and isinstance(f0, str)
+            if (USE_FAST and fast_upload is not None and isinstance(f0, str)
                     and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
                 try:
                     with open(f0, "rb") as fh:
@@ -2118,7 +2121,21 @@ async def on_button(event):
 
 
 # ----------------------------- startup -----------------------------
+def _quiet_exception_handler(loop, context):
+    # hide harmless asyncio noise from abandoned network coroutines
+    msg = context.get("message", "")
+    if "Task was destroyed but it is pending" in msg:
+        return
+    if isinstance(context.get("exception"), GeneratorExit):
+        return
+    loop.default_exception_handler(context)
+
+
 async def main():
+    try:
+        bot.loop.set_exception_handler(_quiet_exception_handler)
+    except Exception:
+        pass
     try:
         await bot.start(bot_token=bot_token)
     except Exception as e:
