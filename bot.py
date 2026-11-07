@@ -2459,8 +2459,9 @@ async def _set_command_menu():
 
 
 async def main():
-    # hide Telethon's transient connection/auth warnings (they are retried automatically)
-    logging.getLogger("telethon").setLevel(logging.ERROR)
+    # during startup keep Telethon's logs visible so a flood-wait countdown is shown
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("telethon").setLevel(logging.INFO)
     print(f"Channel Tools Assistant {VERSION}: starting up…", flush=True)
     # clear any leftover temp download files from a previous run so they don't fill the disk
     try:
@@ -2486,6 +2487,8 @@ async def main():
     except Exception as e:
         print(f"WARN: get_me failed ({e})", flush=True)
         uname = "?"
+    # connected — now quiet the per-transfer connection noise
+    logging.getLogger("telethon").setLevel(logging.ERROR)
     print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
     print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
     # set the command menu in the background so it can never hold up startup
