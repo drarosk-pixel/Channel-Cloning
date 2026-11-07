@@ -22,9 +22,16 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import (
     MessageMediaWebPage, MessageMediaPoll, Channel, PeerChannel,
     BotCommand, BotCommandScopeDefault,
+    DocumentAttributeFilename, DocumentAttributeVideo,
 )
 
-VERSION = "v9"
+try:
+    # parallel multi-connection upload (much faster uploads for large files)
+    from FastTelethon import upload_file as fast_upload
+except Exception:
+    fast_upload = None
+
+VERSION = "v10"
 
 
 def need(name):
@@ -52,6 +59,7 @@ PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
+FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel upload above this size
 
 # `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
 # Each user logs in with /login; their own Telegram account then does the real work.
@@ -648,6 +656,19 @@ def is_doc(m):
     return bool(getattr(m, "document", None))
 
 
+def is_video(m):
+    doc = getattr(m, "document", None)
+    return bool(doc) and any(isinstance(a, DocumentAttributeVideo) for a in doc.attributes)
+
+
+def doc_attrs(m, path):
+    """Original document attributes, with the filename set to the (possibly renamed) file."""
+    doc = getattr(m, "document", None)
+    attrs = [a for a in (doc.attributes if doc else []) if not isinstance(a, DocumentAttributeFilename)]
+    attrs.append(DocumentAttributeFilename(os.path.basename(path)))
+    return attrs, getattr(doc, "mime_type", None)
+
+
 async def send_item(dst, msgs, opts):
     """Sends one message (or one album). Returns True if something was sent."""
     client = S().client
@@ -720,12 +741,26 @@ async def send_item(dst, msgs, opts):
         extra = {"supports_streaming": True} if streaming else {}
         if len(files) == 1:
             raw, ents = caps[0]
-            kw = {}
-            if thumb and is_doc(media_msgs[0]) and media_msgs[0].id in reupload:
-                kw["thumb"] = thumb
-            await client.send_file(dst, files[0], caption=raw,
+            m0 = media_msgs[0]
+            f0 = files[0]
+            thumb_kw = {"thumb": thumb} if (thumb and is_doc(m0)) else {}
+            # parallel multi-connection upload for large downloaded files (much faster)
+            if (fast_upload is not None and isinstance(f0, str)
+                    and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
+                try:
+                    with open(f0, "rb") as fh:
+                        input_file = await fast_upload(client, fh, progress_callback=cb_factory("uploading"))
+                    attrs, mime = doc_attrs(m0, f0)
+                    await client.send_file(dst, input_file, caption=raw, attributes=attrs,
+                                           mime_type=mime, **ent_kw(ents), **thumb_kw)
+                    return
+                except FloodWaitError:
+                    raise
+                except Exception:
+                    pass  # fall back to the normal single-connection upload
+            await client.send_file(dst, f0, caption=raw,
                                    progress_callback=cb_factory("uploading"),
-                                   **ent_kw(ents), **kw, **extra)
+                                   **ent_kw(ents), **thumb_kw, **extra)
         else:
             any_ents = any(e for _, e in caps)
             if any_ents:
