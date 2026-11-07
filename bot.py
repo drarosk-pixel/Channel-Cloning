@@ -958,13 +958,27 @@ def build_pick(kind, header):
     return header + tail, rows
 
 
+def src_header():
+    return ("📥 Step 1 of 4 — Source channel (copy FROM)\n\n"
+            "This can be someone else's channel — it does NOT have to be yours.\n"
+            "• Pick a channel you've joined from the buttons below, or\n"
+            "• For any public channel, send its @username or t.me link, or\n"
+            "• Forward any message from the channel to me.")
+
+
+def dst_header():
+    return (f"✅ Source: {S().conv['src_title']}\n\n"
+            "📤 Step 2 of 4 — Destination channel (copy TO)\n\n"
+            "This must be YOUR channel (your account is an admin).\n"
+            "Pick one below, or send its ID / @username, or forward a message from it.")
+
+
 async def ask_src():
     conv = S().conv
     conv["step"] = "src"
     conv["pick_src"] = await list_channels(admin_only=False)
     conv["pick_src_page"] = 0
-    header = "📥 Step 1 of 4 — Source channel\n\nChoose the channel to copy FROM."
-    text, rows = build_pick("src", header)
+    text, rows = build_pick("src", src_header())
     await say(text, buttons=rows)
 
 
@@ -973,10 +987,7 @@ async def ask_dst():
     conv["step"] = "dst"
     conv["pick_dst"] = await list_channels(admin_only=True)
     conv["pick_dst_page"] = 0
-    header = (f"✅ Source: {conv['src_title']}\n\n"
-              "📤 Step 2 of 4 — Destination channel\n\n"
-              "Choose a channel where your account is an admin (to copy TO).")
-    text, rows = build_pick("dst", header)
+    text, rows = build_pick("dst", dst_header())
     await say(text, buttons=rows)
 
 
@@ -1673,11 +1684,7 @@ async def on_button(event):
             except ValueError:
                 return await expired()
             conv[f"pick_{kind}_page"] = int(page)
-            header = ("📥 Step 1 of 4 — Source channel\n\nChoose the channel to copy FROM."
-                      if kind == "src" else
-                      f"✅ Source: {conv['src_title']}\n\n📤 Step 2 of 4 — Destination channel\n\n"
-                      "Choose a channel where your account is an admin (to copy TO).")
-            text, rows = build_pick(kind, header)
+            text, rows = build_pick(kind, src_header() if kind == "src" else dst_header())
             await event.answer()
             try:
                 await event.edit(text, buttons=rows)
