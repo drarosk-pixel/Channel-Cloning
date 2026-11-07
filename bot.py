@@ -73,6 +73,7 @@ class UserSession:
         self.client = None          # the user's own Telegram account client
         self.login_client = None     # temporary client used during /login
         self.dialogs_loaded = False
+        self.chan_cache = {}        # {"all"/"admin": (timestamp, [(id, title), ...])}
         self.started_at = time.time()
         self.conv = {}
         self.job = {}
@@ -89,6 +90,7 @@ class UserSession:
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
             phone=None, phone_code_hash=None,
+            pick_src=[], pick_src_page=0, pick_dst=[], pick_dst_page=0,
         )
 
     def reset_job(self):
@@ -264,8 +266,8 @@ HELP = (
     "4. If you use two-step verification, enter your password.\n\n"
     "Copying content\n"
     "1. Send /copy.\n"
-    "2. Send the source channel (ID, @username, or forward any message from it).\n"
-    "3. Send the destination channel the same way.\n"
+    "2. Pick the source channel from the buttons (or send an ID/@username, or forward a message).\n"
+    "3. Pick the destination the same way (your admin channels are listed).\n"
     "4. Choose where to start: the beginning, a message ID, or resume.\n"
     "5. Open the Extras menu (all optional), then tap Done and Start.\n"
     "Shortcut: /copy <source> <destination> [message id]\n\n"
@@ -894,27 +896,88 @@ def start_create_job():
 
 
 # ----------------------------- guided copy flow -----------------------------
+PICK_PAGE = 6
+
+
+async def list_channels(admin_only):
+    """Returns [(ref_id, title), ...] of the user's channels (cached ~2 min)."""
+    sess = S()
+    key = "admin" if admin_only else "all"
+    now = time.time()
+    cached = sess.chan_cache.get(key)
+    if cached and now - cached[0] < 120:
+        return cached[1]
+    out = []
+    try:
+        async for d in sess.client.iter_dialogs():
+            ent = d.entity
+            if isinstance(ent, Channel):
+                if admin_only and not (getattr(ent, "creator", False) or getattr(ent, "admin_rights", None)):
+                    continue
+                out.append((int("-100" + str(ent.id)), title_of(ent)))
+                if len(out) >= 200:
+                    break
+        sess.dialogs_loaded = True
+    except Exception:
+        pass
+    sess.chan_cache[key] = (now, out)
+    return out
+
+
+def pick_rows(kind, items, page):
+    start = page * PICK_PAGE
+    rows = [[Button.inline(f"📢 {t[:40]}", f"pk:{kind}:{start + i}".encode())]
+            for i, (cid, t) in enumerate(items[start:start + PICK_PAGE])]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ Prev", f"pg:{kind}:{page - 1}".encode()))
+    if start + PICK_PAGE < len(items):
+        nav.append(Button.inline("Next ▶️", f"pg:{kind}:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    return rows
+
+
+def build_pick(kind, header):
+    conv = S().conv
+    items = conv.get(f"pick_{kind}") or []
+    page = conv.get(f"pick_{kind}_page", 0)
+    last = get_setting("last_src" if kind == "src" else "last_dst")
+    rows = []
+    if last:
+        rows.append([Button.inline(f"♻️ Last: {last['title'][:28]}",
+                                   b"src:last" if kind == "src" else b"dst:last")])
+    rows += pick_rows(kind, items, page)
+    rows.append([Button.inline("✖️ Cancel", b"cancel")])
+    if items:
+        tp = (len(items) + PICK_PAGE - 1) // PICK_PAGE
+        tail = (f"\n\n👇 Tap a channel below (page {page + 1}/{tp}), "
+                "or send an ID / @username / forward a message from it.")
+    else:
+        tail = "\n\nSend the channel ID (-100…) or @username, or forward any message from it."
+    return header + tail, rows
+
+
 async def ask_src():
     conv = S().conv
     conv["step"] = "src"
-    last = get_setting("last_src")
-    buttons = [[Button.inline(f"Use last source: {last['title'][:35]}", b"src:last")]] if last else None
-    await say("📥 Step 1 of 4 — Source channel\n\n"
-              "Send the ID or @username of the channel to copy FROM.\n"
-              "• Private channel IDs start with -100 (for example -1001234567890).\n"
-              "• Or forward any message from that channel to me.\n\n"
-              "Send /stop to cancel.", buttons=buttons)
+    conv["pick_src"] = await list_channels(admin_only=False)
+    conv["pick_src_page"] = 0
+    header = "📥 Step 1 of 4 — Source channel\n\nChoose the channel to copy FROM."
+    text, rows = build_pick("src", header)
+    await say(text, buttons=rows)
 
 
 async def ask_dst():
     conv = S().conv
     conv["step"] = "dst"
-    last = get_setting("last_dst")
-    buttons = [[Button.inline(f"Use last destination: {last['title'][:30]}", b"dst:last")]] if last else None
-    await say(f"✅ Source: {conv['src_title']}\n\n"
+    conv["pick_dst"] = await list_channels(admin_only=True)
+    conv["pick_dst_page"] = 0
+    header = (f"✅ Source: {conv['src_title']}\n\n"
               "📤 Step 2 of 4 — Destination channel\n\n"
-              "Send the ID or @username of the channel to copy TO, or forward any message from it.\n"
-              "Your account must be an admin there.", buttons=buttons)
+              "Choose a channel where your account is an admin (to copy TO).")
+    text, rows = build_pick("dst", header)
+    await say(text, buttons=rows)
 
 
 async def ask_start():
@@ -1604,6 +1667,40 @@ async def on_button(event):
             await event.edit(f"Destination selected: {last['title']}")
             if await set_dst(last["ref"]):
                 await copy_next()
+        elif data.startswith("pg:"):
+            try:
+                _, kind, page = data.split(":")
+            except ValueError:
+                return await expired()
+            conv[f"pick_{kind}_page"] = int(page)
+            header = ("📥 Step 1 of 4 — Source channel\n\nChoose the channel to copy FROM."
+                      if kind == "src" else
+                      f"✅ Source: {conv['src_title']}\n\n📤 Step 2 of 4 — Destination channel\n\n"
+                      "Choose a channel where your account is an admin (to copy TO).")
+            text, rows = build_pick(kind, header)
+            await event.answer()
+            try:
+                await event.edit(text, buttons=rows)
+            except Exception:
+                pass
+        elif data.startswith("pk:"):
+            try:
+                _, kind, idx = data.split(":")
+                idx = int(idx)
+            except ValueError:
+                return await expired()
+            items = conv.get(f"pick_{kind}") or []
+            if idx >= len(items) or step != kind:
+                return await expired()
+            cid, title = items[idx]
+            await event.answer()
+            await event.edit(f"Selected: {title}")
+            if kind == "src":
+                if await set_src(cid):
+                    await copy_next()
+            else:
+                if await set_dst(cid):
+                    await copy_next()
         elif data in ("start:begin", "start:resume") and step == "start":
             await event.answer()
             if data == "start:begin":
