@@ -1127,29 +1127,37 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                         break
                     group, prepared = item
                     last_id = group[-1].id
-                    if isinstance(prepared, dict) and "__error__" in prepared:
-                        job["failed"] += len(group)
-                        record_error(f"message ID {last_id}", prepared["__error__"])
-                    else:
-                        job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
-                        sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
-                        clean_tmp(prepared)
-                        if extra_tmp:
-                            shutil.rmtree(extra_tmp, ignore_errors=True)
-                        if err is not None:
+                    # one item's failure must never stop the whole copy
+                    try:
+                        if isinstance(prepared, dict) and "__error__" in prepared:
                             job["failed"] += len(group)
-                            record_error(f"message ID {last_id}", err)
-                        elif sent:
-                            job["done"] += len(group)
-                            job["bytes_done"] += group_bytes(group)
+                            record_error(f"message ID {last_id}", prepared["__error__"])
                         else:
-                            job["skipped"] += len(group)
+                            job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                            sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+                            clean_tmp(prepared)
+                            if extra_tmp:
+                                shutil.rmtree(extra_tmp, ignore_errors=True)
+                            if err is not None:
+                                job["failed"] += len(group)
+                                record_error(f"message ID {last_id}", err)
+                            elif sent:
+                                job["done"] += len(group)
+                                job["bytes_done"] += group_bytes(group)
+                            else:
+                                job["skipped"] += len(group)
+                    except Exception as e:
+                        job["failed"] += len(group)
+                        record_error(f"message ID {last_id}", e)
                     job["cur_id"] = last_id
                     save_progress(job["key"], last_id)
                     if job["stop"]:
                         break
-                    await asyncio.sleep(job["delay"])
-                    await refresh(status)
+                    try:
+                        await asyncio.sleep(job["delay"])
+                        await refresh(status)
+                    except Exception:
+                        pass
             finally:
                 prod.cancel()
                 try:
@@ -1171,33 +1179,38 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                 nonlocal group
                 if not group:
                     return
+                g, group = group, []
+                last_id = g[-1].id
                 job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
-                last_id = group[-1].id
+                # one item's failure must never stop the whole copy
                 try:
-                    prepared = await prepare_group(group, opts)
-                except Exception as e:
-                    prepared = {"__error__": e, "tmp": None}
-                if isinstance(prepared, dict) and "__error__" in prepared:
-                    job["failed"] += len(group)
-                    record_error(f"message ID {last_id}", prepared["__error__"])
-                else:
-                    sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
-                    clean_tmp(prepared)
-                    if extra_tmp:
-                        shutil.rmtree(extra_tmp, ignore_errors=True)
-                    if err is not None:
-                        job["failed"] += len(group)
-                        record_error(f"message ID {last_id}", err)
-                    elif sent:
-                        job["done"] += len(group)
-                        job["bytes_done"] += group_bytes(group)
+                    prepared = await prepare_group(g, opts)
+                    if isinstance(prepared, dict) and "__error__" in prepared:
+                        job["failed"] += len(g)
+                        record_error(f"message ID {last_id}", prepared["__error__"])
                     else:
-                        job["skipped"] += len(group)
+                        sent, err, extra_tmp = await send_group(dst, g, prepared, opts)
+                        clean_tmp(prepared)
+                        if extra_tmp:
+                            shutil.rmtree(extra_tmp, ignore_errors=True)
+                        if err is not None:
+                            job["failed"] += len(g)
+                            record_error(f"message ID {last_id}", err)
+                        elif sent:
+                            job["done"] += len(g)
+                            job["bytes_done"] += group_bytes(g)
+                        else:
+                            job["skipped"] += len(g)
+                except Exception as e:
+                    job["failed"] += len(g)
+                    record_error(f"message ID {last_id}", e)
                 job["cur_id"] = last_id
                 save_progress(job["key"], last_id)
-                group = []
-                await asyncio.sleep(job["delay"])
-                await refresh(status)
+                try:
+                    await asyncio.sleep(job["delay"])
+                    await refresh(status)
+                except Exception:
+                    pass
 
             async for m in client.iter_messages(src, reverse=True, min_id=min_id):
                 if job["stop"]:

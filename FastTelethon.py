@@ -219,23 +219,18 @@ class ParallelTransferrer:
                   f"{connection_count} {part_size} {part_count} {file!s}")
         await self._init_download(connection_count, file, part_count, part_size)
 
+        # NOTE: cleanup is done by the caller (download_file), NOT in a finally here.
+        # Awaiting inside an async generator's finally during GeneratorExit raises
+        # "RuntimeError: coroutine ignored GeneratorExit", which could crash the whole copy.
         part = 0
-        try:
-            while part < part_count:
-                tasks = []
-                for sender in self.senders:
-                    tasks.append(self.loop.create_task(sender.next()))
-                for task in tasks:
-                    data = await task
-                    if not data:
-                        break
-                    yield data
-                    part += 1
-                    log.debug(f"Part {part} downloaded")
-        finally:
-            # always clean up, even if the consumer stops early or an error occurs
-            log.debug("Parallel download finished, cleaning up connections")
-            await self._cleanup()
+        while part < part_count:
+            tasks = [self.loop.create_task(sender.next()) for sender in self.senders]
+            for task in tasks:
+                data = await task
+                if not data:
+                    break
+                yield data
+                part += 1
 
 
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
@@ -303,13 +298,17 @@ async def download_file(client: TelegramClient,
     # transfer at a time per client avoids "server closed the connection" errors.
     async with parallel_transfer_locks[("dl", id(client))]:
         downloader = ParallelTransferrer(client, dc_id)
-        downloaded = downloader.download(location, size)
-        async for x in downloaded:
-            out.write(x)
-            if progress_callback:
-                r = progress_callback(out.tell(), size)
-                if inspect.isawaitable(r):
-                    await r
+        try:
+            async for x in downloader.download(location, size):
+                out.write(x)
+                if progress_callback:
+                    r = progress_callback(out.tell(), size)
+                    if inspect.isawaitable(r):
+                        await r
+        finally:
+            # clean up the parallel connections here (outside the generator) so a half-consumed
+            # download never raises "coroutine ignored GeneratorExit"
+            await downloader._cleanup()
     return out
 
 
