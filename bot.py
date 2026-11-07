@@ -84,6 +84,8 @@ USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
 # If a transfer makes no progress for this many seconds, treat the connection as dead,
 # abort that attempt and retry (so one stuck file can't freeze the copy for hours).
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
+# How many times to auto-retry a stalled transfer before asking the user what to do.
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
 
 
 # ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
@@ -153,6 +155,7 @@ class UserSession:
             force_dl=False,
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
+            pending=None, paused=False, pending_id=0,
         )
 
 
@@ -642,6 +645,8 @@ def render_job():
             sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
             lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}: {p:.1f}% "
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job.get("paused") and job.get("pending_id"):
+            lines.append(f"⏸ Paused — tap a button to retry/skip message ID {job['pending_id']} (nothing skipped yet)")
         if job["force_dl"]:
             # download/upload mode: the per-file speed above is the real one; show total moved
             if job["bytes_done"]:
@@ -918,7 +923,7 @@ async def with_stall_guard(coro, prefix):
                 pass
 
 
-async def run_transfer(make_coro, prefix, attempts=3):
+async def run_transfer(make_coro, prefix, attempts=RETRY_ATTEMPTS):
     """Runs a transfer with the stall guard, retrying a few times if it stalls."""
     last = None
     for _ in range(attempts):
@@ -1085,6 +1090,100 @@ def group_bytes(group):
     return sum((getattr(getattr(m, "file", None), "size", None) or 0) for m in group)
 
 
+def clean_tmp(prepared):
+    t = prepared.get("tmp") if isinstance(prepared, dict) else None
+    if t:
+        shutil.rmtree(t, ignore_errors=True)
+
+
+async def _send_prepared(dst, group, prepared, opts):
+    """Send an already-downloaded group. Returns (status, bytes, error)."""
+    try:
+        sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+    except Exception as e:
+        clean_tmp(prepared)
+        return "fail", 0, e
+    clean_tmp(prepared)
+    if extra_tmp:
+        shutil.rmtree(extra_tmp, ignore_errors=True)
+    if err is not None:
+        return "fail", 0, err
+    if sent:
+        return "done", group_bytes(group), None
+    return "skip", 0, None
+
+
+async def _download_and_send(dst, group, opts):
+    """Download then send a group. Returns (status, bytes, error)."""
+    try:
+        prepared = await prepare_group(group, opts)
+    except Exception as e:
+        return "fail", 0, e
+    if isinstance(prepared, dict) and "__error__" in prepared:
+        return "fail", 0, prepared["__error__"]
+    return await _send_prepared(dst, group, prepared, opts)
+
+
+async def ask_retry(last_id, err):
+    """Pause the copy and ask the user: retry / skip / stop. Returns the chosen string."""
+    sess = S()
+    job = sess.job
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["pending_id"] = last_id
+    job["paused"] = True
+    name = type(err).__name__ if err else "error"
+    detail = (str(err) or name).replace("\n", " ")[:160] if err else ""
+    try:
+        await say(f"⚠️ Couldn't copy message ID {last_id} after {RETRY_ATTEMPTS} automatic tries.\n"
+                  f"{name}: {detail}\n\n"
+                  "Nothing has been skipped. What should I do?",
+                  buttons=[[Button.inline("🔁 Retry this file", b"job:retry")],
+                           [Button.inline("⏭ Skip this file", b"job:skip")],
+                           [Button.inline("🛑 Stop the copy", b"job:stop")]])
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["paused"] = False
+
+
+async def process_with_retry(dst, group, opts, prepared=None):
+    """Copy one group. On any failure, pause and ask the user (retry / skip / stop).
+    Nothing is ever skipped without the user choosing to."""
+    job = S().job
+    last_id = group[-1].id
+    while True:
+        if prepared is not None:
+            status, nbytes, err = await _send_prepared(dst, group, prepared, opts)
+            prepared = None                 # consumed; any retry re-downloads from scratch
+        else:
+            status, nbytes, err = await _download_and_send(dst, group, opts)
+        if status == "done":
+            job["done"] += len(group)
+            job["bytes_done"] += nbytes
+            return
+        if status == "skip":
+            job["skipped"] += len(group)
+            return
+        # failure — record it and ask the user (no automatic skipping)
+        record_error(f"message ID {last_id}", err)
+        if job["stop"]:
+            job["failed"] += len(group)
+            return
+        decision = await ask_retry(last_id, err)
+        if decision == "skip":
+            job["failed"] += len(group)
+            return
+        if decision == "stop":
+            job["stop"] = True
+            job["failed"] += len(group)
+            return
+        # decision == "retry": loop and try again
+
+
 async def run_copy(src_ref, dst_ref, min_id, opts):
     sess = S()
     client = sess.client
@@ -1110,11 +1209,6 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                 await asyncio.sleep(2)
         except asyncio.CancelledError:
             pass
-
-    def clean_tmp(prepared):
-        t = prepared.get("tmp") if isinstance(prepared, dict) else None
-        if t:
-            shutil.rmtree(t, ignore_errors=True)
 
     try:
         src = await resolve(src_ref, "Source channel")
@@ -1176,28 +1270,9 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                         break
                     group, prepared = item
                     last_id = group[-1].id
-                    # one item's failure must never stop the whole copy
-                    try:
-                        if isinstance(prepared, dict) and "__error__" in prepared:
-                            job["failed"] += len(group)
-                            record_error(f"message ID {last_id}", prepared["__error__"])
-                        else:
-                            job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
-                            sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
-                            clean_tmp(prepared)
-                            if extra_tmp:
-                                shutil.rmtree(extra_tmp, ignore_errors=True)
-                            if err is not None:
-                                job["failed"] += len(group)
-                                record_error(f"message ID {last_id}", err)
-                            elif sent:
-                                job["done"] += len(group)
-                                job["bytes_done"] += group_bytes(group)
-                            else:
-                                job["skipped"] += len(group)
-                    except Exception as e:
-                        job["failed"] += len(group)
-                        record_error(f"message ID {last_id}", e)
+                    job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                    arg = None if (isinstance(prepared, dict) and "__error__" in prepared) else prepared
+                    await process_with_retry(dst, group, opts, prepared=arg)
                     job["cur_id"] = last_id
                     save_progress(job["key"], last_id)
                     if job["stop"]:
@@ -1231,28 +1306,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                 g, group = group, []
                 last_id = g[-1].id
                 job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
-                # one item's failure must never stop the whole copy
-                try:
-                    prepared = await prepare_group(g, opts)
-                    if isinstance(prepared, dict) and "__error__" in prepared:
-                        job["failed"] += len(g)
-                        record_error(f"message ID {last_id}", prepared["__error__"])
-                    else:
-                        sent, err, extra_tmp = await send_group(dst, g, prepared, opts)
-                        clean_tmp(prepared)
-                        if extra_tmp:
-                            shutil.rmtree(extra_tmp, ignore_errors=True)
-                        if err is not None:
-                            job["failed"] += len(g)
-                            record_error(f"message ID {last_id}", err)
-                        elif sent:
-                            job["done"] += len(g)
-                            job["bytes_done"] += group_bytes(g)
-                        else:
-                            job["skipped"] += len(g)
-                except Exception as e:
-                    job["failed"] += len(g)
-                    record_error(f"message ID {last_id}", e)
+                await process_with_retry(dst, g, opts)
                 job["cur_id"] = last_id
                 save_progress(job["key"], last_id)
                 try:
@@ -1978,6 +2032,12 @@ async def cmd_errors(arg):
 
 async def cmd_stop(arg):
     sess = S()
+    fut = sess.job.get("pending")
+    if fut is not None and not fut.done():
+        sess.job["stop"] = True
+        fut.set_result("stop")
+        await say("🛑 Stopping…")
+        return
     if sess.job["running"]:
         sess.job["stop"] = True
         await say("🛑 Stopping after the current item…")
@@ -2200,7 +2260,22 @@ async def on_button(event):
         await event.answer("This request has expired. Please start again.", alert=True)
 
     try:
-        if data == "cancel":
+        if data in ("job:retry", "job:skip", "job:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done():
+                return await expired()
+            await event.answer()
+            label = {"job:retry": "🔁 Retrying this file…",
+                     "job:skip": "⏭ Skipping this file.",
+                     "job:stop": "🛑 Stopping the copy."}[data]
+            try:
+                await event.edit(label)
+            except Exception:
+                pass
+            if data == "job:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data == "cancel":
             await event.answer()
             sess.reset_conv()
             await event.edit("Cancelled. Send /copy or /create whenever you're ready.")
