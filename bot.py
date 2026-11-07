@@ -102,6 +102,7 @@ class UserSession:
             cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
             rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
             name="", total=0, key="", last_result="", delay=DELAY,
+            force_dl=False, phase_detail="", cur_cur=0, cur_tot=0, cur_speed=0.0,
         )
 
 
@@ -303,7 +304,10 @@ HELP = (
     "• A stopped or failed copy can be resumed from where it left off.\n"
     "• Speed: use /speed to lower the delay (e.g. 0.8s). If Telegram pauses you "
     "(flood wait), /status shows a live countdown and the copy resumes automatically "
-    "from the same message when the wait ends."
+    "from the same message when the wait ends.\n"
+    "• Protected/private sources: the bot detects these and goes straight to "
+    "download-and-upload mode (no wasted attempt). /status shows live download/upload "
+    "percentage and speed for the current file."
 )
 
 ABOUT = (
@@ -568,7 +572,15 @@ def render_job():
         lines.append(f"{bar(pct)} {pct:.0f}%")
         lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
-        # live speed
+        # live per-file transfer (download/upload) progress
+        if job["phase_detail"] and job["cur_tot"]:
+            p = job["cur_cur"] / job["cur_tot"] * 100
+            icon = "⬇️ Downloading" if job["phase_detail"] == "downloading" else "⬆️ Uploading"
+            lines.append(f"{icon}: {p:.1f}% ({fmt_size(job['cur_cur'])} / {fmt_size(job['cur_tot'])})")
+            if job["cur_speed"] > 0:
+                eta_f = (job["cur_tot"] - job["cur_cur"]) / job["cur_speed"]
+                lines.append(f"⚡ {fmt_size(job['cur_speed'])}/s • this file ~{fmt_duration(eta_f)} left")
+        # overall speed
         if elapsed > 0:
             mpm = job["done"] / (elapsed / 60)
             speed = [f"{fmt_size(job['bytes_done'] / elapsed)}/s"] if job["bytes_done"] else []
@@ -644,6 +656,23 @@ async def send_item(dst, msgs, opts):
     link_rules = opts["link_rules"]
     thumb = opts["thumb"]
     footer = opts["footer"]
+    job = S().job
+
+    def cb_factory(kind):
+        st = {"t": time.time(), "b": 0}
+
+        def cb(cur, tot):
+            now = time.time()
+            job["phase_detail"] = kind
+            job["cur_cur"] = cur
+            job["cur_tot"] = tot or 0
+            dt = now - st["t"]
+            if dt >= 0.5:
+                job["cur_speed"] = max(0.0, cur - st["b"]) / dt
+                st["t"] = now
+                st["b"] = cur
+        return cb
+
     do_text = bool(rules) and scope in ("both", "text")
     do_names = bool(rules) and scope in ("both", "names")
 
@@ -679,9 +708,13 @@ async def send_item(dst, msgs, opts):
                     names[m.id] = new
 
     # a file must be re-uploaded (download then upload) if it is renamed,
-    # or if a custom thumbnail should be attached to a video/document
-    reupload = {m.id for m in media_msgs
-                if m.id in names or (thumb and is_doc(m))}
+    # if a custom thumbnail should be attached, or if the source restricts saving
+    # (private/protected channels) — in that case skip the pointless direct attempt.
+    if job.get("force_dl"):
+        reupload = {m.id for m in media_msgs}
+    else:
+        reupload = {m.id for m in media_msgs
+                    if m.id in names or (thumb and is_doc(m))}
 
     async def upload(files, streaming):
         extra = {"supports_streaming": True} if streaming else {}
@@ -690,7 +723,9 @@ async def send_item(dst, msgs, opts):
             kw = {}
             if thumb and is_doc(media_msgs[0]) and media_msgs[0].id in reupload:
                 kw["thumb"] = thumb
-            await client.send_file(dst, files[0], caption=raw, **ent_kw(ents), **kw, **extra)
+            await client.send_file(dst, files[0], caption=raw,
+                                   progress_callback=cb_factory("uploading"),
+                                   **ent_kw(ents), **kw, **extra)
         else:
             any_ents = any(e for _, e in caps)
             if any_ents:
@@ -699,7 +734,8 @@ async def send_item(dst, msgs, opts):
             else:
                 cap_list = [r for r, _ in caps]
                 kw = {"parse_mode": None}
-            await client.send_file(dst, files, caption=cap_list, **kw, **extra)
+            await client.send_file(dst, files, caption=cap_list,
+                                   progress_callback=cb_factory("uploading"), **kw, **extra)
 
     tmp = None
 
@@ -709,9 +745,10 @@ async def send_item(dst, msgs, opts):
             tmp = tempfile.mkdtemp(prefix="cp_")
         sub = os.path.join(tmp, str(i))
         os.makedirs(sub, exist_ok=True)
+        dcb = cb_factory("downloading")
         if m.id in names:
-            return await m.download_media(file=os.path.join(sub, names[m.id]))
-        return await m.download_media(file=sub + os.sep)
+            return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
+        return await m.download_media(file=sub + os.sep, progress_callback=dcb)
 
     try:
         try:
@@ -723,11 +760,17 @@ async def send_item(dst, msgs, opts):
         except FloodWaitError:
             raise
         except Exception:
-            pass  # fall back to a full download and re-upload
+            # direct copy failed (often a protected/restricted source): download + re-upload,
+            # and remember it so later messages skip the wasted direct attempt
+            job["force_dl"] = True
         files = [await download(i, m) for i, m in enumerate(media_msgs)]
         await upload(files, streaming=True)
         return True
     finally:
+        job["phase_detail"] = ""
+        job["cur_cur"] = 0
+        job["cur_tot"] = 0
+        job["cur_speed"] = 0.0
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -765,15 +808,13 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     status = None
     ticker_task = None
 
-    async def flood_ticker():
-        # keeps the live flood-wait countdown updating while Telegram makes us wait
+    async def progress_ticker():
+        # keeps /status live: file download/upload progress and the flood-wait countdown
         try:
             while job["running"]:
-                if job["flood_until"] > time.time():
-                    await refresh(status, force=True)
-                    await asyncio.sleep(2)
-                else:
-                    await asyncio.sleep(1)
+                force = job["flood_until"] > time.time() or bool(job["phase_detail"])
+                await refresh(status, force=force)
+                await asyncio.sleep(2)
         except asyncio.CancelledError:
             pass
 
@@ -781,11 +822,14 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         src = await resolve(src_ref, "Source channel")
         dst = await resolve(dst_ref, "Destination channel")
         job.update(src=title_of(src), dst=title_of(dst), key=f"{src.id}->{dst.id}")
+        # protected/private source: skip the pointless direct-copy attempt, download+upload directly
+        if getattr(src, "noforwards", False):
+            job["force_dl"] = True
         latest = await client.get_messages(src, limit=1)
         job["top_id"] = max(latest[0].id if latest else min_id, min_id)
         status = await say("▶️ Copy started…")
         await refresh(status, force=True)
-        ticker_task = asyncio.create_task(flood_ticker())
+        ticker_task = asyncio.create_task(progress_ticker())
 
         group = []
 
