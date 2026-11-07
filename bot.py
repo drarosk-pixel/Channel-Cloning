@@ -105,7 +105,11 @@ sys.unraisablehook = _quiet_unraisablehook
 
 # `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
 # Each user logs in with /login; their own Telegram account then does the real work.
-bot = TelegramClient(StringSession(), api_id, api_hash)
+# A PERSISTENT session file means the bot authorizes with Telegram only once; later restarts
+# reuse it, so rapid restarts can't trigger Telegram's bot-authorization rate limit (flood).
+# flood_sleep_threshold lets Telethon wait out a flood automatically instead of hammering it.
+BOT_SESSION = os.environ.get("BOT_SESSION", "bot")
+bot = TelegramClient(BOT_SESSION, api_id, api_hash, flood_sleep_threshold=3600)
 bot.parse_mode = None  # bot messages are plain text
 
 
