@@ -40,6 +40,7 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `EDIT_EVERY` | no | `4` | Seconds between live status updates |
 | `SESSIONS_FILE` | no | `sessions.json` | Where logged-in sessions are stored |
 | `THUMB_DIR` | no | `thumbs` | Folder for per-user custom thumbnails |
+| `DOWNLOAD_DIR` | no | `./dl_tmp` | Where big files are downloaded temporarily. Keep it on large storage, not `/tmp` |
 | `USE_FAST` | no | `1` | Parallel multi-connection **upload** (fast uploads). Set `0` to disable |
 | `USE_FAST_DL` | no | `1` | Parallel **download** via FastTelethon. Set `0` for plain download |
 | `PIPELINE` | no | `0` | `1` = overlap download+upload (~2x, more connections). `0` = one at a time (stable) |
