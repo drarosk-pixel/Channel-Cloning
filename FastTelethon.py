@@ -28,6 +28,10 @@ except ImportError:
 
 log: logging.Logger = logging.getLogger("telethon")
 
+# Max parallel connections per transfer. Fewer = more stable on shared hosting
+# (too many makes Telegram drop connections). Override with FT_CONNECTIONS.
+MAX_CONNECTIONS = int(os.environ.get("FT_CONNECTIONS", "8"))
+
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
                      InputFileLocation, InputPhotoFileLocation]
 
@@ -118,15 +122,18 @@ class ParallelTransferrer:
         self.upload_ticker = 0
 
     async def _cleanup(self) -> None:
-        await asyncio.gather(*[sender.disconnect() for sender in self.senders])
+        if not self.senders:
+            return
+        await asyncio.gather(*[sender.disconnect() for sender in self.senders],
+                             return_exceptions=True)
         self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 20,
+    def _get_connection_count(file_size: int, max_count: int = MAX_CONNECTIONS,
                               full_size: int = 100 * 1024 * 1024) -> int:
         if file_size > full_size:
             return max_count
-        return math.ceil((file_size / full_size) * max_count)
+        return max(1, math.ceil((file_size / full_size) * max_count))
 
     async def _init_download(self, connections: int, file: TypeLocation, part_count: int,
                              part_size: int) -> None:
@@ -213,20 +220,22 @@ class ParallelTransferrer:
         await self._init_download(connection_count, file, part_count, part_size)
 
         part = 0
-        while part < part_count:
-            tasks = []
-            for sender in self.senders:
-                tasks.append(self.loop.create_task(sender.next()))
-            for task in tasks:
-                data = await task
-                if not data:
-                    break
-                yield data
-                part += 1
-                log.debug(f"Part {part} downloaded")
-
-        log.debug("Parallel download finished, cleaning up connections")
-        await self._cleanup()
+        try:
+            while part < part_count:
+                tasks = []
+                for sender in self.senders:
+                    tasks.append(self.loop.create_task(sender.next()))
+                for task in tasks:
+                    data = await task
+                    if not data:
+                        break
+                    yield data
+                    part += 1
+                    log.debug(f"Part {part} downloaded")
+        finally:
+            # always clean up, even if the consumer stops early or an error occurs
+            log.debug("Parallel download finished, cleaning up connections")
+            await self._cleanup()
 
 
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
@@ -250,29 +259,33 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
-    buffer = bytearray()
-    for data in stream_file(response):
-        if progress_callback:
-            r = progress_callback(response.tell(), file_size)
-            if inspect.isawaitable(r):
-                await r
-        if not is_large:
-            hash_md5.update(data)
-        if len(buffer) == 0 and len(data) == part_size:
-            await uploader.upload(data)
-            continue
-        new_len = len(buffer) + len(data)
-        if new_len >= part_size:
-            cutoff = part_size - len(buffer)
-            buffer.extend(data[:cutoff])
+    try:
+        buffer = bytearray()
+        for data in stream_file(response):
+            if progress_callback:
+                r = progress_callback(response.tell(), file_size)
+                if inspect.isawaitable(r):
+                    await r
+            if not is_large:
+                hash_md5.update(data)
+            if len(buffer) == 0 and len(data) == part_size:
+                await uploader.upload(data)
+                continue
+            new_len = len(buffer) + len(data)
+            if new_len >= part_size:
+                cutoff = part_size - len(buffer)
+                buffer.extend(data[:cutoff])
+                await uploader.upload(bytes(buffer))
+                buffer.clear()
+                buffer.extend(data[cutoff:])
+            else:
+                buffer.extend(data)
+        if len(buffer) > 0:
             await uploader.upload(bytes(buffer))
-            buffer.clear()
-            buffer.extend(data[cutoff:])
-        else:
-            buffer.extend(data)
-    if len(buffer) > 0:
-        await uploader.upload(bytes(buffer))
-    await uploader.finish_upload()
+        await uploader.finish_upload()
+    finally:
+        # always release the parallel connections, even on error
+        await uploader._cleanup()
     if is_large:
         return InputFileBig(file_id, part_count, "upload"), file_size
     else:
@@ -286,16 +299,17 @@ async def download_file(client: TelegramClient,
                         ) -> BinaryIO:
     size = location.size
     dc_id, location = utils.get_input_location(location)
-    # We lock the transfers because telegram has connection count limits
-    downloader = ParallelTransferrer(client, dc_id)
-    downloaded = downloader.download(location, size)
-    async for x in downloaded:
-        out.write(x)
-        if progress_callback:
-            r = progress_callback(out.tell(), size)
-            if inspect.isawaitable(r):
-                await r
-
+    # Lock per account: Telegram limits concurrent connections, so one parallel
+    # transfer at a time per client avoids "server closed the connection" errors.
+    async with parallel_transfer_locks[id(client)]:
+        downloader = ParallelTransferrer(client, dc_id)
+        downloaded = downloader.download(location, size)
+        async for x in downloaded:
+            out.write(x)
+            if progress_callback:
+                r = progress_callback(out.tell(), size)
+                if inspect.isawaitable(r):
+                    await r
     return out
 
 
@@ -304,6 +318,8 @@ async def upload_file(client: TelegramClient,
                       progress_callback: callable = None,
 
                       ) -> TypeInputFile:
-    res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
+    # Lock per account to stay within Telegram's connection limits
+    async with parallel_transfer_locks[id(client)]:
+        res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
     return res
 
