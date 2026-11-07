@@ -90,7 +90,8 @@ class UserSession:
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
             phone=None, phone_code_hash=None,
-            pick_src=[], pick_src_page=0, pick_dst=[], pick_dst_page=0,
+            pick_src=[], pick_src_all=[], pick_src_page=0,
+            pick_dst=[], pick_dst_all=[], pick_dst_page=0,
         )
 
     def reset_job(self):
@@ -915,7 +916,7 @@ async def list_channels(admin_only):
                 if admin_only and not (getattr(ent, "creator", False) or getattr(ent, "admin_rights", None)):
                     continue
                 out.append((int("-100" + str(ent.id)), title_of(ent)))
-                if len(out) >= 200:
+                if len(out) >= 1000:
                     break
         sess.dialogs_loaded = True
     except Exception:
@@ -951,10 +952,11 @@ def build_pick(kind, header):
     rows.append([Button.inline("✖️ Cancel", b"cancel")])
     if items:
         tp = (len(items) + PICK_PAGE - 1) // PICK_PAGE
-        tail = (f"\n\n👇 Tap a channel below (page {page + 1}/{tp}), "
-                "or send an ID / @username / forward a message from it.")
+        tail = (f"\n\n👇 Tap a channel (page {page + 1}/{tp}). "
+                "Lots of channels? Just type part of the name to search. "
+                "You can also send an @username or forward a message.")
     else:
-        tail = "\n\nSend the channel ID (-100…) or @username, or forward any message from it."
+        tail = "\n\nType part of a channel's name to search, or send an @username, or forward a message from it."
     return header + tail, rows
 
 
@@ -976,7 +978,9 @@ def dst_header():
 async def ask_src():
     conv = S().conv
     conv["step"] = "src"
-    conv["pick_src"] = await list_channels(admin_only=False)
+    items = await list_channels(admin_only=False)
+    conv["pick_src_all"] = items
+    conv["pick_src"] = items
     conv["pick_src_page"] = 0
     text, rows = build_pick("src", src_header())
     await say(text, buttons=rows)
@@ -985,10 +989,48 @@ async def ask_src():
 async def ask_dst():
     conv = S().conv
     conv["step"] = "dst"
-    conv["pick_dst"] = await list_channels(admin_only=True)
+    items = await list_channels(admin_only=True)
+    conv["pick_dst_all"] = items
+    conv["pick_dst"] = items
     conv["pick_dst_page"] = 0
     text, rows = build_pick("dst", dst_header())
     await say(text, buttons=rows)
+
+
+async def handle_channel_text(kind, text, fwd):
+    """Handles typed input at the source/destination step: forward, @username/ID, or a search query."""
+    conv = S().conv
+    label = "Source" if kind == "src" else "Destination"
+    setfn = set_src if kind == "src" else set_dst
+    if fwd:
+        if await setfn(fwd):
+            await copy_next()
+        return
+    tokens = text.split()
+    ref = None
+    if len(tokens) == 1:
+        try:
+            ref = check_ref(tokens[0], label)
+        except BadInput:
+            ref = None
+    if ref is not None:
+        if await setfn(ref):
+            await copy_next()
+        return
+    # treat the text as a search over the user's channels
+    q = text.strip().lower()
+    all_items = conv.get(f"pick_{kind}_all") or []
+    matches = [it for it in all_items if q in it[1].lower()] if q else all_items
+    conv[f"pick_{kind}"] = matches
+    conv[f"pick_{kind}_page"] = 0
+    base = src_header() if kind == "src" else dst_header()
+    if matches:
+        header = base + f"\n\n🔍 {len(matches)} match(es) for “{text.strip()}”:"
+        txt, rows = build_pick(kind, header)
+        await say(txt, buttons=rows)
+    else:
+        await say(f"🔍 No channels matching “{text.strip()}”.\n"
+                  "Try fewer letters, or send the @username / ID, or forward a message from the channel.")
 
 
 async def ask_start():
@@ -1531,21 +1573,9 @@ async def handle_text(event, text):
         await say("✅ Caption/promo text saved.")
         await ask_caption()
     elif step == "src":
-        try:
-            ref = fwd or check_ref(text.split()[0] if text.split() else "", "Source")
-        except BadInput as e:
-            await say(f"❌ {e}\n\nSend the channel ID (-100...) or @username, forward a message from it, or /stop.")
-            return
-        if await set_src(ref):
-            await copy_next()
+        await handle_channel_text("src", text, fwd)
     elif step == "dst":
-        try:
-            ref = fwd or check_ref(text.split()[0] if text.split() else "", "Destination")
-        except BadInput as e:
-            await say(f"❌ {e}\n\nSend the channel ID (-100...) or @username, forward a message from it, or /stop.")
-            return
-        if await set_dst(ref):
-            await copy_next()
+        await handle_channel_text("dst", text, fwd)
     elif step == "start":
         if text.isdigit():
             set_start_from_id(int(text))
