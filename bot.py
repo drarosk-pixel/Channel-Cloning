@@ -1244,11 +1244,12 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         # keeps /status live. Only force an edit during a flood countdown; otherwise respect
         # EDIT_EVERY so we don't edit the message so often that Telegram rate-limits the bot
         # (which made it respond to other commands late).
+        tick = max(1.0, EDIT_EVERY / 2)   # so EDIT_EVERY alone controls how often /status refreshes
         try:
             while job["running"]:
                 force = job["flood_until"] > time.time()
                 await refresh(status, force=force)
-                await asyncio.sleep(3)
+                await asyncio.sleep(tick)
         except asyncio.CancelledError:
             pass
 
