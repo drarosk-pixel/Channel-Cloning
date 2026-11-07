@@ -2432,25 +2432,9 @@ def _quiet_exception_handler(loop, context):
     loop.default_exception_handler(context)
 
 
-async def main():
-    # hide Telethon's transient connection/auth warnings (they are retried automatically)
-    logging.getLogger("telethon").setLevel(logging.ERROR)
-    # clear any leftover temp download files from a previous run so they don't fill the disk
-    if DOWNLOAD_DIR and os.path.isdir(DOWNLOAD_DIR):
-        for name in os.listdir(DOWNLOAD_DIR):
-            shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
+async def _set_command_menu():
     try:
-        bot.loop.set_exception_handler(_quiet_exception_handler)
-    except Exception:
-        pass
-    try:
-        await bot.start(bot_token=bot_token)
-    except Exception as e:
-        print(f"ERROR: BOT_TOKEN looks invalid: {e}")
-        sys.exit(1)
-    bme = await bot.get_me()
-    try:
-        await bot(SetBotCommandsRequest(
+        await asyncio.wait_for(bot(SetBotCommandsRequest(
             scope=BotCommandScopeDefault(), lang_code="",
             commands=[
                 BotCommand("start", "Welcome message"),
@@ -2465,12 +2449,44 @@ async def main():
                 BotCommand("ping", "Check that the bot is online"),
                 BotCommand("about", "About this assistant"),
                 BotCommand("help", "How to use this assistant"),
-            ]))
+            ])), timeout=30)
     except Exception as e:
-        print(f"Could not set the command menu: {e}")
+        print(f"Note: could not set the command menu ({e}); the bot still works.", flush=True)
 
-    print(f"Channel Tools Assistant {VERSION} is running. Bot: @{bme.username}")
-    print(f"Logged-in users remembered: {len(session_strings)}")
+
+async def main():
+    # hide Telethon's transient connection/auth warnings (they are retried automatically)
+    logging.getLogger("telethon").setLevel(logging.ERROR)
+    print(f"Channel Tools Assistant {VERSION}: starting up…", flush=True)
+    # clear any leftover temp download files from a previous run so they don't fill the disk
+    try:
+        if DOWNLOAD_DIR and os.path.isdir(DOWNLOAD_DIR):
+            for name in os.listdir(DOWNLOAD_DIR):
+                shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
+    except Exception as e:
+        print(f"Temp cleanup skipped: {e}", flush=True)
+    try:
+        bot.loop.set_exception_handler(_quiet_exception_handler)
+    except Exception:
+        pass
+    print("Connecting to Telegram… (if this hangs, Telegram may have rate-limited the bot "
+          "after many quick restarts — just wait a few minutes)", flush=True)
+    try:
+        await bot.start(bot_token=bot_token)
+    except Exception as e:
+        print(f"ERROR: could not start the bot (check BOT_TOKEN / network): {e}", flush=True)
+        sys.exit(1)
+    try:
+        bme = await bot.get_me()
+        uname = bme.username
+    except Exception as e:
+        print(f"WARN: get_me failed ({e})", flush=True)
+        uname = "?"
+    print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
+    print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
+    # set the command menu in the background so it can never hold up startup
+    asyncio.create_task(_set_command_menu())
+    print("Now listening for messages. Send /ping in the bot to test.", flush=True)
     await bot.run_until_disconnected()
 
 
