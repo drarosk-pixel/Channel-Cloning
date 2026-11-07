@@ -776,6 +776,10 @@ async def download_one(client, m, tmp, idx, names, dcb):
     sub = os.path.join(tmp, str(idx))
     os.makedirs(sub, exist_ok=True)
     size = getattr(getattr(m, "file", None), "size", None) or 0
+    # show the download is being attempted even before the first bytes arrive
+    job = S().job
+    job["dl_tot"] = size
+    job["dl_cur"] = 0
     if USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN:
         try:
             fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
@@ -790,20 +794,6 @@ async def download_one(client, m, tmp, idx, names, dcb):
     if m.id in names:
         return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
     return await m.download_media(file=sub + os.sep, progress_callback=dcb)
-
-
-async def wait_for_disk(needed):
-    """Block until there's room for `needed` bytes (+margin), so temp files never fill the disk."""
-    job = S().job
-    base = tempfile.gettempdir()
-    margin = 300 * 1024 * 1024
-    while not job["stop"]:
-        try:
-            if shutil.disk_usage(base).free > needed + margin:
-                return
-        except Exception:
-            return
-        await asyncio.sleep(1)
 
 
 async def prepare_group(group, opts):
@@ -837,9 +827,6 @@ async def prepare_group(group, opts):
 
     tmp = None
     if reupload:
-        needed = sum((getattr(getattr(m, "file", None), "size", None) or 0)
-                     for m in media_msgs if m.id in reupload)
-        await wait_for_disk(needed)
         dcb = xfer_cb("dl")
         while True:
             try:
