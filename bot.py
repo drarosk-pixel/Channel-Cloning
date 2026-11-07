@@ -112,7 +112,8 @@ class UserSession:
             rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
             name="", total=0, total_msgs=0, key="", last_result="", delay=DELAY,
             force_dl=False,
-            dl_cur=0, dl_tot=0, dl_speed=0.0, ul_cur=0, ul_tot=0, ul_speed=0.0,
+            dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
+            ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
         )
 
 
@@ -591,14 +592,17 @@ def render_job():
             lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
         # live transfer progress — download (of the next file) and upload (of the current) run together
-        if job["dl_tot"]:
-            p = job["dl_cur"] / job["dl_tot"] * 100
-            sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
-            lines.append(f"⬇️ Downloading: {p:.1f}% ({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        tc = f"/{total_c}" if total_c else ""
         if job["ul_tot"]:
             p = job["ul_cur"] / job["ul_tot"] * 100
             sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
-            lines.append(f"⬆️ Uploading: {p:.1f}% ({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
+            lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}: {p:.1f}% "
+                         f"({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
+        if job["dl_tot"]:
+            p = job["dl_cur"] / job["dl_tot"] * 100
+            sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
+            lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}: {p:.1f}% "
+                         f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
         if job["force_dl"]:
             # download/upload mode: the per-file speed above is the real one; show total moved
             if job["bytes_done"]:
@@ -974,8 +978,11 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
 
         async def producer():
             group = []
+            enq = [0]
 
             async def enqueue(g):
+                job["dl_no"] = enq[0] + 1   # content number currently being downloaded
+                enq[0] += len(g)
                 try:
                     prepared = await prepare_group(g, opts)
                 except Exception as e:
@@ -1011,6 +1018,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                     job["failed"] += len(group)
                     record_error(f"message ID {last_id}", prepared["__error__"])
                 else:
+                    job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1  # current content number
                     sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
                     clean_tmp(prepared)
                     if extra_tmp:
