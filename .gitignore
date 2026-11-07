@@ -2,6 +2,7 @@
 sessions.json
 progress.json
 settings.json
+thumbs/
 *.session
 *.session-journal
 

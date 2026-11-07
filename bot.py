@@ -24,7 +24,7 @@ from telethon.tl.types import (
     BotCommand, BotCommandScopeDefault,
 )
 
-VERSION = "v8"
+VERSION = "v9"
 
 
 def need(name):
@@ -51,6 +51,7 @@ EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "4"))        # seconds between l
 PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
+THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
 
 # `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
 # Each user logs in with /login; their own Telegram account then does the real work.
@@ -83,7 +84,9 @@ class UserSession:
         self.conv.update(
             kind=None, step=None,
             src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
-            start=None, start_label="", rules=None, scope=None,
+            start=None, start_label="",
+            rules=[], scope="both", link_rules=[],
+            thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
             phone=None, phone_code_hash=None,
         )
@@ -92,9 +95,10 @@ class UserSession:
         self.job.clear()
         self.job.update(
             running=False, stop=False, kind=None, phase="idle", last_edit=0.0,
-            started=0.0, src="", dst="", done=0, failed=0, skipped=0,
+            started=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
             cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
-            rules_n=0, scope="both", name="", total=0, key="", last_result="",
+            rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
+            name="", total=0, key="", last_result="",
         )
 
 
@@ -171,6 +175,14 @@ def fmt_duration(sec):
     return f"{s}s"
 
 
+def fmt_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+
 def title_of(ent):
     return getattr(ent, "title", None) or getattr(ent, "first_name", None) or str(getattr(ent, "id", "?"))
 
@@ -224,8 +236,8 @@ async def require_login(sess):
 WELCOME = (
     "👋 Welcome, {name}!\n\n"
     "I'm your Channel Tools Assistant. After you log in with your own Telegram account, I can:\n"
-    "• Copy all content (videos, photos, files, text) from one channel to another, "
-    "optionally replacing words in captions and file names.\n"
+    "• Copy all content (videos, photos, files, text) from one channel to another, with extras: "
+    "replace words, replace hidden hyperlink URLs, set a custom thumbnail, and add a caption / promo link.\n"
     "• Create several private channels with the same name in one go.\n\n"
     "First send /login to connect your account. Then send /copy or /create.\n"
     "Send /help for the full guide."
@@ -238,7 +250,7 @@ HELP = (
     "/logout - Disconnect your account\n"
     "/copy - Copy content from one channel to another (guided)\n"
     "/create - Create multiple private channels (guided)\n"
-    "/status - Live progress of your current task\n"
+    "/status - Live progress (with speed) of your current task\n"
     "/errors - Detailed list of recent errors\n"
     "/stop - Stop your current task (or discard a draft)\n"
     "/ping - Check that I'm online\n"
@@ -247,43 +259,42 @@ HELP = (
     "Logging in\n"
     "1. Send /login.\n"
     "2. Send your phone number in international format (e.g. +919876543210).\n"
-    "3. Enter the login code Telegram sends you. Type it with spaces or dashes between the "
-    "digits (e.g. 1 2 3 4 5) so Telegram doesn't block it.\n"
-    "4. If you use two-step verification, enter your password.\n"
-    "Your login lets the bot act on your behalf, so only use a bot you trust.\n\n"
+    "3. Enter the login code. Type it with spaces or dashes between the digits "
+    "(e.g. 1 2 3 4 5) so Telegram doesn't block it.\n"
+    "4. If you use two-step verification, enter your password.\n\n"
     "Copying content\n"
     "1. Send /copy.\n"
     "2. Send the source channel (ID, @username, or forward any message from it).\n"
     "3. Send the destination channel the same way.\n"
-    "4. Choose where to start: the beginning, a message ID, or resume the last run.\n"
-    "5. Optionally add word replacements, then tap Start.\n"
+    "4. Choose where to start: the beginning, a message ID, or resume.\n"
+    "5. Open the Extras menu (all optional), then tap Done and Start.\n"
     "Shortcut: /copy <source> <destination> [message id]\n\n"
-    "Replacing words (optional)\n"
-    "Send one rule per line in the format: old word => new word\n"
-    "Example:\n"
-    "Lecture => Class\n"
-    "@oldchannel => @newchannel\n"
-    "Leave the right side empty to remove a word. Matching ignores upper/lower case. "
-    "Rules can be applied to captions and text, to file names, or both. "
-    "File extensions are never changed. "
-    "Renaming a file means it must be downloaded and uploaded again, so those files take longer.\n\n"
+    "Extras (optional)\n"
+    "• Replace words — in captions/text and/or file names. One rule per line: old => new. "
+    "Leave the right side empty to remove a word. Case-insensitive.\n"
+    "• Replace links — rewrite the hidden URL inside hyperlinks. One rule per line: "
+    "old => new (e.g. t.me/oldchannel => t.me/newchannel).\n"
+    "• Thumbnail — send a photo; it's used as the thumbnail for copied videos/documents "
+    "(those files are re-uploaded, so they take longer).\n"
+    "• Caption / promo link — extra text added to every caption. Use markdown for a "
+    "clickable promo link: [Join here](https://t.me/yourchannel). Choose append or prepend.\n\n"
     "Creating channels\n"
     "Send /create, then the channel name and the number of channels. "
     "Shortcut: /create <name> <number>\n\n"
     "Channel IDs\n"
     "Private channel IDs start with -100 (for example -1001234567890). "
-    "You can also simply forward any message from the channel to me and I'll read the ID.\n\n"
+    "You can also forward any message from the channel to me.\n\n"
     "Good to know\n"
     "• Your account must be a member of the source and an admin of the destination.\n"
     "• Only one task runs at a time per user.\n"
-    "• A stopped or failed copy can be resumed from where it left off.\n"
-    "• Errors are shown in /status together with their error name and code."
+    "• A stopped or failed copy can be resumed from where it left off."
 )
 
 ABOUT = (
     f"ℹ️ Channel Tools Assistant {VERSION}\n\n"
-    "Log in with your own Telegram account, then copy channel content with optional word "
-    "replacement (captions and file names) and create multiple channels. Use /help for instructions."
+    "Log in with your own Telegram account, then copy channel content with extras "
+    "(replace words, replace hyperlink URLs, custom thumbnail, caption/promo link) "
+    "and create multiple channels. Use /help for instructions."
 )
 
 GREETING_RE = re.compile(r"^(hi+|hello+|hey+|hola|namaste|good\s+(morning|afternoon|evening))\b", re.I)
@@ -333,7 +344,7 @@ def fwd_channel_id(msg):
     return None
 
 
-# ----------------------------- word replacement -----------------------------
+# ----------------------------- text / entity utilities -----------------------------
 def add_surrogate(text):
     """Python str -> UTF-16 units (Telegram entity offsets are UTF-16 based)."""
     return "".join(
@@ -347,6 +358,10 @@ def del_surrogate(text):
     return text.encode("utf-16", "surrogatepass").decode("utf-16")
 
 
+def utf16_len(text):
+    return len(add_surrogate(text or ""))
+
+
 class Rules:
     """Compiled word-replacement rules (case-insensitive, longest match first)."""
 
@@ -356,6 +371,11 @@ class Rules:
         self.pat_p = re.compile("|".join(re.escape(k) for k in sorted(self.d_p, key=len, reverse=True)), re.I)
         self.d_s = {add_surrogate(o).lower(): add_surrogate(n) for o, n in self.pairs}
         self.pat_s = re.compile("|".join(re.escape(k) for k in sorted(self.d_s, key=len, reverse=True)), re.I)
+
+    def sub_plain(self, text):
+        if not text:
+            return text
+        return self.pat_p.sub(lambda m: self.d_p.get(m.group(0).lower(), m.group(0)), text)
 
 
 def parse_rules(text):
@@ -419,15 +439,70 @@ def replace_in_text(raw_text, entities, rules):
     return del_surrogate(new_raw), new_ents
 
 
+def apply_link_rules(entities, link_rules):
+    """Rewrites the hidden URL inside hyperlink entities (e.g. [text](url))."""
+    if not link_rules:
+        return entities
+    out = []
+    for e in entities or []:
+        c = copy.copy(e)
+        url = getattr(c, "url", None)
+        if url:
+            c.url = link_rules.sub_plain(url)
+        out.append(c)
+    return out
+
+
+def apply_footer(raw_text, entities, footer):
+    """Adds an extra caption / promo text (with its own entities) to a message."""
+    if not footer:
+        return raw_text, list(entities or [])
+    ftext, fents, pos = footer
+    if not ftext:
+        return raw_text, list(entities or [])
+    text = raw_text or ""
+    ents = [copy.copy(e) for e in (entities or [])]
+    fe = [copy.copy(e) for e in (fents or [])]
+    sep = "\n\n" if text.strip() else ""
+    if pos == "prepend":
+        new_text = ftext + sep + text
+        shift = utf16_len(ftext + sep)
+        for e in ents:
+            e.offset += shift
+        return new_text, fe + ents
+    new_text = text + sep + ftext
+    shift = utf16_len(text + sep)
+    for e in fe:
+        e.offset += shift
+    return new_text, ents + fe
+
+
 def rename_file(name, rules):
     """Applies the rules to a file name (extension is never changed)."""
     stem, ext = os.path.splitext(name)
-    new = rules.pat_p.sub(lambda m: rules.d_p.get(m.group(0).lower(), m.group(0)), stem)
+    new = rules.sub_plain(stem)
     new = re.sub(r"[\\/\x00]", "_", new)
     new = re.sub(r"\s{2,}", " ", new).strip()
     if not new:
         new = "file"
     return new + ext
+
+
+def normalize_thumb(src_path, dst_path):
+    """Makes a Telegram-friendly jpg thumbnail (<=320px). Falls back to a plain copy."""
+    try:
+        from PIL import Image
+        with Image.open(src_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            im.save(dst_path, "JPEG", quality=70)
+        return True
+    except Exception:
+        try:
+            shutil.copyfile(src_path, dst_path)
+            return True
+        except Exception:
+            return False
 
 
 # ----------------------------- errors -----------------------------
@@ -477,13 +552,28 @@ def render_job():
         lines.append(f"{bar(pct)} {pct:.0f}%")
         lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
+        # live speed
+        if elapsed > 0:
+            mpm = job["done"] / (elapsed / 60)
+            speed = [f"{fmt_size(job['bytes_done'] / elapsed)}/s"] if job["bytes_done"] else []
+            speed.append(f"{mpm:.0f} msg/min")
+            lines.append(f"Speed: {' • '.join(speed)}  ({fmt_size(job['bytes_done'])} moved)")
         eta = ""
         if phase == "running" and pct >= 2 and elapsed > 20:
             eta = f" | ETA: ~{fmt_duration(elapsed * (100 - pct) / pct)}"
         lines.append(f"Elapsed: {fmt_duration(elapsed)}{eta}")
+        extras = []
         if job["rules_n"]:
             scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}[job["scope"]]
-            lines.append(f"Replace rules: {job['rules_n']} ({scope})")
+            extras.append(f"word rules: {job['rules_n']} ({scope})")
+        if job["link_n"]:
+            extras.append(f"link rules: {job['link_n']}")
+        if job["has_thumb"]:
+            extras.append("custom thumbnail")
+        if job["has_footer"]:
+            extras.append("caption/promo")
+        if extras:
+            lines.append("Extras: " + ", ".join(extras))
     else:
         total = max(job["total"], 1)
         pct = 100.0 if phase == "done" else job["done"] / total * 100
@@ -523,27 +613,43 @@ def ent_kw(ents):
     return {"formatting_entities": ents} if ents else {"parse_mode": None}
 
 
-async def send_item(dst, msgs, rules, scope):
+def is_doc(m):
+    return bool(getattr(m, "document", None))
+
+
+async def send_item(dst, msgs, opts):
     """Sends one message (or one album). Returns True if something was sent."""
     client = S().client
-    media_msgs = [m for m in msgs
-                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
+    rules = opts["rules"]
+    scope = opts["scope"]
+    link_rules = opts["link_rules"]
+    thumb = opts["thumb"]
+    footer = opts["footer"]
     do_text = bool(rules) and scope in ("both", "text")
     do_names = bool(rules) and scope in ("both", "names")
 
-    def caption_of(m):
+    media_msgs = [m for m in msgs
+                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
+
+    def caption_of(m, add_foot):
+        raw = m.raw_text or ""
+        ents = list(m.entities or [])
         if do_text:
-            return replace_in_text(m.raw_text or "", m.entities, rules)
-        return m.raw_text or "", list(m.entities or [])
+            raw, ents = replace_in_text(raw, ents, rules)
+        if link_rules:
+            ents = apply_link_rules(ents, link_rules)
+        if add_foot:
+            raw, ents = apply_footer(raw, ents, footer)
+        return raw, ents
 
     if not media_msgs:
-        raw, ents = caption_of(msgs[0])
+        raw, ents = caption_of(msgs[0], True)
         if raw.strip():
             await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
             return True
         return False
 
-    caps = [caption_of(m) for m in media_msgs]
+    caps = [caption_of(m, i == 0) for i, m in enumerate(media_msgs)]
     names = {}
     if do_names:
         for m in media_msgs:
@@ -553,11 +659,19 @@ async def send_item(dst, msgs, rules, scope):
                 if new != old:
                     names[m.id] = new
 
+    # a file must be re-uploaded (download then upload) if it is renamed,
+    # or if a custom thumbnail should be attached to a video/document
+    reupload = {m.id for m in media_msgs
+                if m.id in names or (thumb and is_doc(m))}
+
     async def upload(files, streaming):
         extra = {"supports_streaming": True} if streaming else {}
         if len(files) == 1:
             raw, ents = caps[0]
-            await client.send_file(dst, files[0], caption=raw, **ent_kw(ents), **extra)
+            kw = {}
+            if thumb and is_doc(media_msgs[0]) and media_msgs[0].id in reupload:
+                kw["thumb"] = thumb
+            await client.send_file(dst, files[0], caption=raw, **ent_kw(ents), **kw, **extra)
         else:
             any_ents = any(e for _, e in caps)
             if any_ents:
@@ -570,13 +684,13 @@ async def send_item(dst, msgs, rules, scope):
 
     tmp = None
 
-    async def download(i, m, rename):
+    async def download(i, m):
         nonlocal tmp
         if tmp is None:
             tmp = tempfile.mkdtemp(prefix="cp_")
         sub = os.path.join(tmp, str(i))
         os.makedirs(sub, exist_ok=True)
-        if rename and m.id in names:
+        if m.id in names:
             return await m.download_media(file=os.path.join(sub, names[m.id]))
         return await m.download_media(file=sub + os.sep)
 
@@ -584,14 +698,14 @@ async def send_item(dst, msgs, rules, scope):
         try:
             files = []
             for i, m in enumerate(media_msgs):
-                files.append(await download(i, m, True) if m.id in names else m.media)
-            await upload(files, streaming=bool(names))
+                files.append(await download(i, m) if m.id in reupload else m.media)
+            await upload(files, streaming=bool(reupload))
             return True
         except FloodWaitError:
             raise
         except Exception:
             pass  # fall back to a full download and re-upload
-        files = [await download(i, m, True) for i, m in enumerate(media_msgs)]
+        files = [await download(i, m) for i, m in enumerate(media_msgs)]
         await upload(files, streaming=True)
         return True
     finally:
@@ -599,12 +713,12 @@ async def send_item(dst, msgs, rules, scope):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def safe_send(dst, group, rules, scope):
+async def safe_send(dst, group, opts):
     """Returns (sent: bool, error: Exception or None). Waits out FloodWait automatically."""
     job = S().job
     while True:
         try:
-            return await send_item(dst, group, rules, scope), None
+            return await send_item(dst, group, opts), None
         except FloodWaitError as e:
             job["flood_until"] = time.time() + e.seconds + 1
             await asyncio.sleep(e.seconds + 1)
@@ -613,14 +727,21 @@ async def safe_send(dst, group, rules, scope):
             return False, e
 
 
-async def run_copy(src_ref, dst_ref, min_id, rules, scope):
+def group_bytes(group):
+    return sum((getattr(getattr(m, "file", None), "size", None) or 0) for m in group)
+
+
+async def run_copy(src_ref, dst_ref, min_id, opts):
     sess = S()
     client = sess.client
     job = sess.job
+    rules = opts["rules"]
     job.update(running=True, stop=False, kind="copy", phase="running", started=time.time(),
-               last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, cur_id=min_id,
-               min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
-               rules_n=len(rules.pairs) if rules else 0, scope=scope)
+               last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
+               cur_id=min_id, min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
+               rules_n=len(rules.pairs) if rules else 0, scope=opts["scope"],
+               link_n=len(opts["link_rules"].pairs) if opts["link_rules"] else 0,
+               has_thumb=bool(opts["thumb"]), has_footer=bool(opts["footer"]))
     status = None
     try:
         src = await resolve(src_ref, "Source channel")
@@ -637,13 +758,14 @@ async def run_copy(src_ref, dst_ref, min_id, rules, scope):
             nonlocal group
             if not group:
                 return
-            sent, err = await safe_send(dst, group, rules, scope)
+            sent, err = await safe_send(dst, group, opts)
             last_id = group[-1].id
             if err is not None:
                 job["failed"] += len(group)
                 record_error(f"message ID {last_id}", err)
             elif sent:
                 job["done"] += len(group)
+                job["bytes_done"] += group_bytes(group)
             else:
                 job["skipped"] += len(group)
             job["cur_id"] = last_id
@@ -701,7 +823,8 @@ async def run_create(name, count):
     client = sess.client
     job = sess.job
     job.update(running=True, stop=False, kind="create", phase="running", started=time.time(),
-               last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0, rules_n=0)
+               last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0,
+               rules_n=0, link_n=0, has_thumb=False, has_footer=False)
     status = await say("▶️ Channel creation started…")
     await refresh(status, force=True)
     try:
@@ -739,13 +862,22 @@ async def run_create(name, count):
         await say("🔔 Task finished. Send /status for details.")
 
 
+def build_opts(conv):
+    rules = Rules(conv["rules"]) if conv["rules"] else None
+    link_rules = Rules(conv["link_rules"]) if conv["link_rules"] else None
+    footer = None
+    if conv["footer_text"]:
+        ftext, fents = tl_markdown.parse(conv["footer_text"])
+        footer = (ftext, fents, conv["footer_pos"])
+    return {"rules": rules, "scope": conv["scope"] or "both", "link_rules": link_rules,
+            "thumb": conv["thumb"], "footer": footer}
+
+
 def start_copy_job():
     sess = S()
     conv = sess.conv
-    pairs = conv["rules"] or []
-    rules = Rules(pairs) if pairs else None
-    scope = conv["scope"] or "both"
-    args = (conv["src"], conv["dst"], conv["start"], rules, scope)
+    opts = build_opts(conv)
+    args = (conv["src"], conv["dst"], conv["start"], opts)
     set_setting("last_src", {"ref": conv["src"], "title": conv["src_title"]})
     set_setting("last_dst", {"ref": conv["dst"], "title": conv["dst_title"]})
     sess.reset_conv()
@@ -761,7 +893,7 @@ def start_create_job():
     asyncio.create_task(run_create(name, count))
 
 
-# ----------------------------- guided flows -----------------------------
+# ----------------------------- guided copy flow -----------------------------
 async def ask_src():
     conv = S().conv
     conv["step"] = "src"
@@ -798,51 +930,137 @@ async def ask_start():
               "Choose where to start, or send a message ID to start from that message.", buttons=rows)
 
 
+async def show_extras():
+    conv = S().conv
+    conv["step"] = "extras"
+    rules = conv["rules"] or []
+    lr = conv["link_rules"] or []
+    footer = conv["footer_text"]
+    rows = [
+        [Button.inline(("✅" if rules else "➕") + f" Replace words ({len(rules)})", b"ex:words")],
+        [Button.inline(("✅" if lr else "➕") + f" Replace links ({len(lr)})", b"ex:links")],
+        [Button.inline(("🖼 Thumbnail: set" if conv["thumb"] else "➕ Add thumbnail"), b"ex:thumb")],
+        [Button.inline(("📝 Caption/promo: set" if footer else "➕ Add caption / promo link"), b"ex:cap")],
+        [Button.inline("✅ Done — review & start", b"ex:done")],
+        [Button.inline("✖️ Cancel", b"cancel")],
+    ]
+    await say("⚙️ Step 4 of 4 — Extras (all optional)\n\n"
+              "Set any of these, then tap Done:\n"
+              f"• Replace words (captions/file names): {len(rules)} rule(s)\n"
+              f"• Replace hidden hyperlink URLs: {len(lr)} rule(s)\n"
+              f"• Custom thumbnail: {'yes' if conv['thumb'] else 'no'}\n"
+              f"• Extra caption / promo link: {'yes (' + conv['footer_pos'] + ')' if footer else 'no'}",
+              buttons=rows)
+
+
 async def ask_rules():
     conv = S().conv
     conv["step"] = "rules"
-    rows = [[Button.inline("⏭ Skip (no changes)", b"rules:skip")]]
+    rows = [[Button.inline("⏭ Clear (no word rules)", b"rules:skip")]]
     prev = get_setting("rules") or []
     if prev:
         rows.insert(0, [Button.inline(f"♻️ Use previous rules ({len(prev)})", b"rules:prev")])
-    await say("✏️ Step 4 of 4 — Replace words (optional)\n\n"
-              "I can replace words in captions/text and in file names while copying.\n"
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("✏️ Replace words\n\n"
+              "I can replace words in captions/text and in file names.\n"
               "Send one rule per line like this:\n\n"
               "old word => new word\n\n"
               "Example:\nLecture => Class\n@oldchannel => @newchannel\n\n"
-              "Matching ignores upper/lower case. Leave the right side empty to remove a word. "
-              "You can send many rules in one message.", buttons=rows)
+              "Matching ignores upper/lower case. Leave the right side empty to remove a word.",
+              buttons=rows)
 
 
 async def ask_scope():
     conv = S().conv
     conv["step"] = "scope"
-    await say(f"✅ {len(conv['rules'])} rule(s) saved.\n\nWhere should they be applied?",
+    await say(f"✅ {len(conv['rules'])} word rule(s) saved.\n\nWhere should they be applied?",
               buttons=[[Button.inline("📝 Captions & file names", b"scope:both")],
                        [Button.inline("📝 Captions / text only", b"scope:text")],
                        [Button.inline("📁 File names only", b"scope:names")]])
+
+
+async def ask_links():
+    conv = S().conv
+    conv["step"] = "links"
+    rows = [[Button.inline("⏭ Clear (no link rules)", b"links:skip")]]
+    prev = get_setting("link_rules") or []
+    if prev:
+        rows.insert(0, [Button.inline(f"♻️ Use previous link rules ({len(prev)})", b"links:prev")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("🔗 Replace links (hidden hyperlink URLs)\n\n"
+              "This rewrites the URL hidden inside clickable text (e.g. [Join](https://t.me/old)).\n"
+              "Send one rule per line:\n\n"
+              "old => new\n\n"
+              "Example:\nt.me/oldchannel => t.me/newchannel\nhttps://old.site => https://new.site\n\n"
+              "Matching ignores upper/lower case.",
+              buttons=rows)
+
+
+async def ask_thumb():
+    conv = S().conv
+    conv["step"] = "thumb"
+    rows = []
+    saved = get_setting("thumb_path")
+    if saved and os.path.exists(saved) and conv["thumb"] != saved:
+        rows.append([Button.inline("♻️ Use last saved thumbnail", b"thumb:saved")])
+    if conv["thumb"]:
+        rows.append([Button.inline("🗑 Remove thumbnail", b"thumb:remove")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("🖼 Custom thumbnail\n\n"
+              "Send me a photo to use as the thumbnail for copied videos and documents.\n"
+              "Those files are re-uploaded (downloaded then sent again), so they take longer.\n"
+              "Photos in the source are copied as-is (thumbnails don't apply to photos).",
+              buttons=rows)
+
+
+async def ask_caption():
+    conv = S().conv
+    conv["step"] = "caption"
+    footer = conv["footer_text"]
+    rows = []
+    if footer:
+        other = "prepend" if conv["footer_pos"] == "append" else "append"
+        rows.append([Button.inline(f"↕️ Position: {conv['footer_pos']} (tap to {other})", b"cap:pos")])
+        rows.append([Button.inline("🗑 Remove caption", b"cap:remove")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    cur = f"\n\nCurrent ({conv['footer_pos']}):\n{footer}" if footer else ""
+    await say("📝 Caption / promo link\n\n"
+              "Send the extra text to add to every caption. For a clickable promo link use markdown:\n\n"
+              "[Join our channel](https://t.me/yourchannel)\n\n"
+              "You can mix normal text and links. Send new text to replace the current one." + cur,
+              buttons=rows)
 
 
 async def show_copy_confirm():
     conv = S().conv
     conv["step"] = "confirm"
     rules = conv["rules"] or []
+    lr = conv["link_rules"] or []
     scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}.get(conv["scope"] or "both")
     lines = ["✅ Everything is ready.\n",
              f"Source: {conv['src_title']}",
              f"Destination: {conv['dst_title']}",
              f"Start: {conv['start_label']}"]
     if rules:
-        lines.append(f"Replace rules: {len(rules)} ({scope})")
-        for o, n in rules[:8]:
+        lines.append(f"Word rules: {len(rules)} ({scope})")
+        for o, n in rules[:6]:
             lines.append(f"   {o} → {n if n else '(remove)'}")
-        if len(rules) > 8:
-            lines.append(f"   …and {len(rules) - 8} more")
-    else:
-        lines.append("Replace rules: none")
-    if rules and conv["scope"] in ("both", "names"):
-        lines.append("\nNote: renamed files are downloaded and uploaded again, so they take longer.")
+        if len(rules) > 6:
+            lines.append(f"   …and {len(rules) - 6} more")
+    if lr:
+        lines.append(f"Link rules: {len(lr)}")
+        for o, n in lr[:4]:
+            lines.append(f"   {o} → {n}")
+    if conv["thumb"]:
+        lines.append("Custom thumbnail: on")
+    if conv["footer_text"]:
+        lines.append(f"Caption/promo ({conv['footer_pos']}): {conv['footer_text'][:60]}")
+    if not (rules or lr or conv["thumb"] or conv["footer_text"]):
+        lines.append("Extras: none")
+    if (rules and conv["scope"] in ("both", "names")) or conv["thumb"]:
+        lines.append("\nNote: renamed files and files with a custom thumbnail are downloaded and uploaded again, so they take longer.")
     await say("\n".join(lines), buttons=[[Button.inline("▶️ Start copying", b"go")],
+                                         [Button.inline("⬅️ Back to extras", b"ex:back")],
                                          [Button.inline("✖️ Cancel", b"cancel")]])
 
 
@@ -854,12 +1072,8 @@ async def copy_next():
         await ask_dst()
     elif conv["start"] is None:
         await ask_start()
-    elif conv["rules"] is None:
-        await ask_rules()
-    elif conv["rules"] and conv["scope"] is None:
-        await ask_scope()
     else:
-        await show_copy_confirm()
+        await show_extras()
 
 
 async def set_src(ref):
@@ -905,6 +1119,34 @@ def set_start_from_id(n):
     conv["start_label"] = f"message ID {n}" if n > 0 else "the beginning"
 
 
+async def save_thumb_from(event):
+    """Downloads a photo the user sent and stores it as their thumbnail."""
+    sess = S()
+    conv = sess.conv
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    dst = os.path.join(THUMB_DIR, f"{sess.user_id}.jpg")
+    tmpf = None
+    try:
+        tmpf = await event.message.download_media(file=tempfile.mktemp(suffix=".img"))
+        ok = normalize_thumb(tmpf, dst)
+    except Exception:
+        ok = False
+    finally:
+        if tmpf and os.path.exists(tmpf):
+            try:
+                os.remove(tmpf)
+            except Exception:
+                pass
+    if ok:
+        conv["thumb"] = dst
+        set_setting("thumb_path", dst)
+        await say("✅ Thumbnail saved.")
+        await show_extras()
+    else:
+        await say("❌ I couldn't process that image. Please send a normal photo, or tap Back.")
+
+
+# ----------------------------- guided create flow -----------------------------
 async def ask_create_name():
     conv = S().conv
     conv["step"] = "c_name"
@@ -1199,6 +1441,21 @@ async def handle_text(event, text):
         await login_code(text)
     elif step == "login_password":
         await login_password(text)
+    elif step == "thumb":
+        msg = event.message
+        is_image = bool(msg.photo) or (msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("image/"))
+        if is_image:
+            await save_thumb_from(event)
+        else:
+            await say("Please send a photo to use as the thumbnail, or tap Back.")
+    elif step == "caption":
+        if not text.strip():
+            await say("Please send some text for the caption, or tap Back.")
+            return
+        conv["footer_text"] = text.strip()
+        set_setting("footer_text", conv["footer_text"])
+        await say("✅ Caption/promo text saved.")
+        await ask_caption()
     elif step == "src":
         try:
             ref = fwd or check_ref(text.split()[0] if text.split() else "", "Source")
@@ -1225,18 +1482,34 @@ async def handle_text(event, text):
         pairs, bad = parse_rules(text)
         if bad:
             await say("❌ I couldn't read these line(s):\n" + "\n".join(f"• {b}" for b in bad[:8]) +
-                      "\n\nUse the format: old word => new word\nSend all rules again, or tap Skip.")
+                      "\n\nUse the format: old word => new word\nSend all rules again, or tap Back.")
             return
         if not pairs:
-            await say("I couldn't find any rule. Use the format: old word => new word, one per line, or tap Skip.")
+            await say("I couldn't find any rule. Use the format: old word => new word, one per line.")
             return
         if len(pairs) > 100:
             await say("❌ Please send at most 100 rules.")
             return
         conv["rules"] = pairs
         set_setting("rules", pairs)
-        await copy_next()
-    elif step in ("scope", "confirm", "c_confirm"):
+        await ask_scope()
+    elif step == "links":
+        pairs, bad = parse_rules(text)
+        if bad:
+            await say("❌ I couldn't read these line(s):\n" + "\n".join(f"• {b}" for b in bad[:8]) +
+                      "\n\nUse the format: old => new\nSend all rules again, or tap Back.")
+            return
+        if not pairs:
+            await say("I couldn't find any rule. Use the format: old => new, one per line.")
+            return
+        if len(pairs) > 100:
+            await say("❌ Please send at most 100 rules.")
+            return
+        conv["link_rules"] = pairs
+        set_setting("link_rules", pairs)
+        await say(f"✅ {len(pairs)} link rule(s) saved.")
+        await show_extras()
+    elif step in ("scope", "extras", "confirm", "c_confirm"):
         await say("Please choose an option using the buttons above, or send /stop to cancel.")
     elif step == "c_name":
         name = text.strip()
@@ -1341,22 +1614,69 @@ async def on_button(event):
                 conv.update(start=last_id, start_label=f"resuming after message ID {last_id}")
             await event.edit(f"Start: {conv['start_label']}")
             await copy_next()
+        # ----- extras hub -----
+        elif data == "ex:words":
+            await event.answer()
+            await ask_rules()
+        elif data == "ex:links":
+            await event.answer()
+            await ask_links()
+        elif data == "ex:thumb":
+            await event.answer()
+            await ask_thumb()
+        elif data == "ex:cap":
+            await event.answer()
+            await ask_caption()
+        elif data == "ex:back":
+            await event.answer()
+            await show_extras()
+        elif data == "ex:done":
+            await event.answer()
+            await show_copy_confirm()
+        # ----- word rules -----
         elif data in ("rules:skip", "rules:prev") and step == "rules":
             await event.answer()
             if data == "rules:skip":
                 conv["rules"] = []
-                await event.edit("Word replacement: skipped")
+                await show_extras()
             else:
-                prev = [tuple(p) for p in (get_setting("rules") or [])]
-                conv["rules"] = prev
-                await event.edit(f"Using the previous {len(prev)} rule(s)")
-            await copy_next()
+                conv["rules"] = [tuple(p) for p in (get_setting("rules") or [])]
+                await ask_scope()
         elif data.startswith("scope:") and step == "scope":
             await event.answer()
             conv["scope"] = data.split(":", 1)[1]
-            await event.edit("Rules applied to: " + {"both": "captions & file names", "text": "captions only",
-                                                      "names": "file names only"}[conv["scope"]])
-            await copy_next()
+            await show_extras()
+        # ----- link rules -----
+        elif data in ("links:skip", "links:prev") and step == "links":
+            await event.answer()
+            if data == "links:skip":
+                conv["link_rules"] = []
+            else:
+                conv["link_rules"] = [tuple(p) for p in (get_setting("link_rules") or [])]
+            await show_extras()
+        # ----- thumbnail -----
+        elif data == "thumb:saved" and step == "thumb":
+            await event.answer()
+            saved = get_setting("thumb_path")
+            if saved and os.path.exists(saved):
+                conv["thumb"] = saved
+                await show_extras()
+            else:
+                await say("No saved thumbnail found. Please send a photo.")
+        elif data == "thumb:remove" and step == "thumb":
+            await event.answer()
+            conv["thumb"] = None
+            await show_extras()
+        # ----- caption / promo -----
+        elif data == "cap:pos" and step == "caption":
+            await event.answer()
+            conv["footer_pos"] = "prepend" if conv["footer_pos"] == "append" else "append"
+            await ask_caption()
+        elif data == "cap:remove" and step == "caption":
+            await event.answer()
+            conv["footer_text"] = None
+            await show_extras()
+        # ----- start -----
         elif data == "go" and step in ("confirm", "c_confirm"):
             if sess.job["running"]:
                 await event.answer("Another task is already running.", alert=True)
