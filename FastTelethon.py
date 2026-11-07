@@ -256,7 +256,9 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
     try:
         buffer = bytearray()
-        for data in stream_file(response):
+        # read whole parts at a time (the original 1 KB reads meant ~1M Python loop
+        # iterations per GB, which can slow uploads on a small VPS CPU)
+        for data in stream_file(response, chunk_size=part_size):
             if progress_callback:
                 r = progress_callback(response.tell(), file_size)
                 if inspect.isawaitable(r):

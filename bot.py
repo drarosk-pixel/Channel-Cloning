@@ -642,12 +642,14 @@ def render_job():
         if job["ul_tot"]:
             p = job["ul_cur"] / job["ul_tot"] * 100
             sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
-            lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}: {p:.1f}% "
+            mode = {"fast": " ⚡fast", "normal": " (normal)", "album": " (album)"}.get(job.get("ul_mode"), "")
+            lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}{mode}: {p:.1f}% "
                          f"({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
         if job["dl_tot"]:
             p = job["dl_cur"] / job["dl_tot"] * 100
             sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
-            lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}: {p:.1f}% "
+            mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("dl_mode"), "")
+            lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}{mode}: {p:.1f}% "
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
         if job.get("paused") and job.get("pending_id"):
             lines.append(f"⏸ Paused — tap a button to retry/skip message ID {job['pending_id']} (nothing skipped yet)")
@@ -884,6 +886,7 @@ async def download_one(client, m, tmp, idx, names, dcb):
     job["dl_tot"] = size
     job["dl_cur"] = 0
     if USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN:
+        job["dl_mode"] = "fast"
         try:
             fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
             path = os.path.join(sub, fname)
@@ -892,8 +895,10 @@ async def download_one(client, m, tmp, idx, names, dcb):
             return path
         except FloodWaitError:
             raise
-        except Exception:
-            pass  # fall back to the normal download
+        except Exception as e:
+            print(f"Fast download failed for message {m.id}: {type(e).__name__}: {e} "
+                  "-> using normal (slower) download", flush=True)
+    job["dl_mode"] = "normal"
     if m.id in names:
         return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
     return await m.download_media(file=sub + os.sep, progress_callback=dcb)
@@ -1004,6 +1009,7 @@ async def prepare_group(group, opts):
 async def do_upload(client, dst, prepared, opts):
     media_msgs, caps, files = prepared["media_msgs"], prepared["caps"], prepared["files"]
     thumb = opts["thumb"]
+    job = S().job
     ucb = xfer_cb("ul")
     if len(files) == 1:
         raw, ents = caps[0]
@@ -1020,6 +1026,7 @@ async def do_upload(client, dst, prepared, opts):
         try:
             if (USE_FAST and fast_upload is not None and isinstance(f0, str)
                     and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
+                job["ul_mode"] = "fast"
                 try:
                     with open(f0, "rb") as fh:
                         input_file = await fast_upload(client, fh, progress_callback=ucb)
@@ -1029,8 +1036,16 @@ async def do_upload(client, dst, prepared, opts):
                     return
                 except FloodWaitError:
                     raise
-                except Exception:
-                    pass  # fall back to the normal single-connection upload
+                except Exception as e:
+                    # fall back to the normal single-connection upload, and say so
+                    print(f"Fast upload failed for message {m0.id}: {type(e).__name__}: {e} "
+                          "-> using normal (slower) upload", flush=True)
+            elif isinstance(f0, str) and is_doc(m0):
+                why = ("USE_FAST=0" if not USE_FAST else
+                       "FastTelethon.py missing" if fast_upload is None else
+                       f"file smaller than {FAST_MIN // (1024 * 1024)} MB")
+                print(f"Normal upload for message {m0.id} ({why})", flush=True)
+            job["ul_mode"] = "normal"
             extra = {"supports_streaming": True} if isinstance(f0, str) else {}
             await client.send_file(dst, f0, caption=raw, progress_callback=ucb,
                                    **ent_kw(ents), **thumb_kw, **extra)
@@ -1041,6 +1056,7 @@ async def do_upload(client, dst, prepared, opts):
                 except Exception:
                     pass
     else:
+        job["ul_mode"] = "album"   # albums go through Telethon's normal upload
         streaming = any(isinstance(f, str) for f in files)
         extra = {"supports_streaming": True} if streaming else {}
         any_ents = any(e for _, e in caps)
