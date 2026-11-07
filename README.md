@@ -41,6 +41,7 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `SESSIONS_FILE` | no | `sessions.json` | Where logged-in sessions are stored |
 | `THUMB_DIR` | no | `thumbs` | Folder for per-user custom thumbnails |
 | `USE_FAST` | no | `1` | Parallel multi-connection transfer (fast uploads). Set `0` to disable |
+| `PIPELINE` | no | `1` | Overlap: download the next file while uploading the current one (~2x). Set `0` for one-at-a-time |
 | `FAST_UPLOAD_MB` | no | `5` | When `USE_FAST=1`, files larger than this use parallel transfer |
 | `FT_CONNECTIONS` | no | `8` | Parallel connections per transfer (lower = more stable on small hosts) |
 | `PROGRESS_FILE` | no | `progress.json` | Per-user copy progress |
