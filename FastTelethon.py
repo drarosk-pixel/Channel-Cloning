@@ -70,57 +70,12 @@ class DownloadSender:
         return self.sender.disconnect()
 
 
-class UploadSender:
-    client: TelegramClient
-    sender: MTProtoSender
-    request: Union[SaveFilePartRequest, SaveBigFilePartRequest]
-    part_count: int
-    stride: int
-    previous: Optional[asyncio.Task]
-    loop: asyncio.AbstractEventLoop
-
-    def __init__(self, client: TelegramClient, sender: MTProtoSender, file_id: int, part_count: int, big: bool,
-                 index: int,
-                 stride: int, loop: asyncio.AbstractEventLoop, on_done: callable = None) -> None:
-        self.client = client
-        self.sender = sender
-        self.on_done = on_done
-        self.part_count = part_count
-        if big:
-            self.request = SaveBigFilePartRequest(file_id, index, part_count, b"")
-        else:
-            self.request = SaveFilePartRequest(file_id, index, b"")
-        self.stride = stride
-        self.previous = None
-        self.loop = loop
-
-    async def next(self, data: bytes) -> None:
-        if self.previous:
-            await self.previous
-        self.previous = self.loop.create_task(self._next(data))
-
-    async def _next(self, data: bytes) -> None:
-        self.request.bytes = data
-        log.debug(f"Sending file part {self.request.file_part}/{self.part_count}"
-                  f" with {len(data)} bytes")
-        await self.client._call(self.sender, self.request)
-        self.request.file_part += self.stride
-        if self.on_done:
-            self.on_done(len(data))   # count only parts Telegram has actually accepted
-
-    async def disconnect(self) -> None:
-        if self.previous:
-            await self.previous
-        return await self.sender.disconnect()
-
-
 class ParallelTransferrer:
     client: TelegramClient
     loop: asyncio.AbstractEventLoop
     dc_id: int
-    senders: Optional[List[Union[DownloadSender, UploadSender]]]
+    senders: Optional[List[Union[DownloadSender, MTProtoSender]]]
     auth_key: AuthKey
-    upload_ticker: int
 
     def __init__(self, client: TelegramClient, dc_id: Optional[int] = None) -> None:
         self.client = client
@@ -129,11 +84,6 @@ class ParallelTransferrer:
         self.auth_key = (None if dc_id and self.client.session.dc_id != dc_id
                          else self.client.session.auth_key)
         self.senders = None
-        self.upload_ticker = 0
-        self.sent_bytes = 0      # bytes confirmed by Telegram, for honest progress/speed
-
-    def _count_sent(self, n: int) -> None:
-        self.sent_bytes += n
 
     async def _cleanup(self) -> None:
         if not self.senders:
@@ -177,19 +127,14 @@ class ParallelTransferrer:
         return DownloadSender(self.client, await self._create_sender(), file, index * part_size, part_size,
                               stride, part_count)
 
-    async def _init_upload(self, connections: int, file_id: int, part_count: int, big: bool
-                           ) -> None:
-        self.senders = [
-            await self._create_upload_sender(file_id, part_count, big, 0, connections),
-            *await asyncio.gather(
-                *[self._create_upload_sender(file_id, part_count, big, i, connections)
-                  for i in range(1, connections)])
-        ]
-
-    async def _create_upload_sender(self, file_id: int, part_count: int, big: bool, index: int,
-                                    stride: int) -> UploadSender:
-        return UploadSender(self.client, await self._create_sender(), file_id, part_count, big, index, stride,
-                            loop=self.loop, on_done=self._count_sent)
+    async def init_upload_senders(self, connections: int) -> List[MTProtoSender]:
+        """Plain connections for uploading. Parts are handed out by a worker pool
+        (see _internal_transfer_to_telegram) so a slow connection can't hold up the rest."""
+        first = await self._create_sender()
+        rest = (await asyncio.gather(*[self._create_sender() for _ in range(1, connections)])
+                if connections > 1 else [])
+        self.senders = [first, *rest]
+        return self.senders
 
     async def _create_sender(self) -> MTProtoSender:
         dc = await self.client._get_dc(self.dc_id)
@@ -206,22 +151,6 @@ class ParallelTransferrer:
             await sender.send(req)
             self.auth_key = sender.auth_key
         return sender
-
-    async def init_upload(self, file_id: int, file_size: int, part_size_kb: Optional[float] = None,
-                          connection_count: Optional[int] = None) -> Tuple[int, int, bool]:
-        connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = int(part_size_kb or PART_KB) * 1024
-        part_count = (file_size + part_size - 1) // part_size
-        is_large = file_size > 10 * 1024 * 1024
-        await self._init_upload(connection_count, file_id, part_count, is_large)
-        return part_size, part_count, is_large
-
-    async def upload(self, part: bytes) -> None:
-        await self.senders[self.upload_ticker].next(part)
-        self.upload_ticker = (self.upload_ticker + 1) % len(self.senders)
-
-    async def finish_upload(self) -> None:
-        await self._cleanup()
 
     async def download(self, file: TypeLocation, file_size: int,
                        part_size_kb: Optional[float] = None,
@@ -266,44 +195,84 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
     file_size = os.path.getsize(response.name)
 
     hash_md5 = hashlib.md5()
+    part_size = PART_KB * 1024
+    part_count = (file_size + part_size - 1) // part_size
+    is_large = file_size > 10 * 1024 * 1024
+
     uploader = ParallelTransferrer(client)
-    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
-    try:
-        buffer = bytearray()
-        # read whole parts at a time (the original 1 KB reads meant ~1M Python loop
-        # iterations per GB, which can slow uploads on a small VPS CPU)
-        for data in stream_file(response, chunk_size=part_size):
-            if progress_callback:
-                # report bytes Telegram has confirmed, not bytes read from disk; reading runs
-                # ahead of the network, which made the reported upload speed jump around
-                r = progress_callback(min(uploader.sent_bytes, file_size), file_size)
-                if inspect.isawaitable(r):
-                    await r
-            if not is_large:
-                hash_md5.update(data)
-            if len(buffer) == 0 and len(data) == part_size:
-                await uploader.upload(data)
-                continue
-            new_len = len(buffer) + len(data)
-            if new_len >= part_size:
-                cutoff = part_size - len(buffer)
-                buffer.extend(data[:cutoff])
-                await uploader.upload(bytes(buffer))
-                buffer.clear()
-                buffer.extend(data[cutoff:])
-            else:
-                buffer.extend(data)
-        if len(buffer) > 0:
-            await uploader.upload(bytes(buffer))
-        await uploader.finish_upload()
-        if progress_callback:
-            # finish_upload waits for the last in-flight parts, so everything is confirmed now
-            r = progress_callback(file_size, file_size)
+    connections = max(1, min(uploader._get_connection_count(file_size), part_count or 1))
+    senders = await uploader.init_upload_senders(connections)
+    log.debug(f"Starting parallel upload: {connections} {part_size} {part_count}")
+
+    # Worker pool: every connection pulls the next part as soon as it is free. The previous
+    # round-robin handed part N to connection N%count and waited for that one connection, so a
+    # single slow connection left all the others idle (downloads never had this problem because
+    # they fire every connection each round).
+    queue: asyncio.Queue = asyncio.Queue(maxsize=connections * 2)
+    sent = [0]      # bytes Telegram has confirmed
+    errors = []
+
+    def report(done: int):
+        if not progress_callback:
+            return None
+        return progress_callback(min(done, file_size), file_size)
+
+    async def worker(sender: MTProtoSender):
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+                if errors:
+                    continue        # keep draining so the producer never blocks
+                index, data = item
+                request = (SaveBigFilePartRequest(file_id, index, part_count, data) if is_large
+                           else SaveFilePartRequest(file_id, index, data))
+                try:
+                    await client._call(sender, request)
+                    sent[0] += len(data)
+                except Exception as e:
+                    errors.append(e)
+            finally:
+                queue.task_done()
+
+    async def ticker():
+        # keeps the reported speed smooth and truthful while the workers run
+        while True:
+            await asyncio.sleep(0.5)
+            r = report(sent[0])
             if inspect.isawaitable(r):
                 await r
+
+    workers = [asyncio.ensure_future(worker(s)) for s in senders]
+    tick = asyncio.ensure_future(ticker()) if progress_callback else None
+    try:
+        # read whole parts at a time (the original 1 KB reads meant ~1M Python loop
+        # iterations per GB, which can slow uploads on a small VPS CPU)
+        index = 0
+        for data in stream_file(response, chunk_size=part_size):
+            if errors:
+                break
+            if not is_large:
+                hash_md5.update(data)
+            await queue.put((index, data))
+            index += 1
+        for _ in senders:
+            await queue.put(None)
+        await asyncio.gather(*workers)
     finally:
-        # always release the parallel connections, even on error
-        await uploader._cleanup()
+        if tick is not None:
+            tick.cancel()
+        for w in workers:
+            if not w.done():
+                w.cancel()
+        await uploader._cleanup()     # always release the parallel connections
+
+    if errors:
+        raise errors[0]
+    r = report(file_size)
+    if inspect.isawaitable(r):
+        await r
     if is_large:
         return InputFileBig(file_id, part_count, "upload"), file_size
     else:
