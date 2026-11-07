@@ -61,9 +61,25 @@ SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
 FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel transfer above this size
-# Parallel multi-connection transfer only helps on high-bandwidth hosts/VPS. On bandwidth-limited
-# shared hosting it adds no speed but can cause connection warnings, so it's OFF by default.
-USE_FAST = os.environ.get("USE_FAST", "0") == "1"
+# Parallel multi-connection transfer. Greatly speeds up uploads (single-connection uploads are slow).
+# ON by default; set USE_FAST=0 to disable. Harmless connection noise is suppressed below.
+USE_FAST = os.environ.get("USE_FAST", "1") == "1"
+
+
+# ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
+_orig_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    exc = getattr(unraisable, "exc_value", None)
+    if isinstance(exc, GeneratorExit):
+        return
+    if isinstance(exc, RuntimeError) and "GeneratorExit" in str(exc):
+        return
+    _orig_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
 
 # `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
 # Each user logs in with /login; their own Telegram account then does the real work.
