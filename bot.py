@@ -81,6 +81,9 @@ PIPELINE = os.environ.get("PIPELINE", "0") == "1"
 # Parallel DOWNLOAD via FastTelethon (on by default). With sequential mode (PIPELINE=0) only one
 # transfer runs at a time, so the connection count stays low and stays stable.
 USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
+# If a transfer makes no progress for this many seconds, treat the connection as dead,
+# abort that attempt and retry (so one stuck file can't freeze the copy for hours).
+STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
 
 
 # ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
@@ -887,6 +890,49 @@ async def download_one(client, m, tmp, idx, names, dcb):
     return await m.download_media(file=sub + os.sep, progress_callback=dcb)
 
 
+async def with_stall_guard(coro, prefix):
+    """Runs a transfer coroutine, but aborts it if it makes no progress for STALL_SECONDS
+    (a silently dead connection), so the copy never freezes forever on one file."""
+    job = S().job
+    task = asyncio.ensure_future(coro)
+    last_cur, last_change = -1, time.time()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if task in done:
+                return task.result()
+            if job["flood_until"] > time.time():
+                last_change = time.time()        # waiting on Telegram, not a stall
+                continue
+            cur = job.get(prefix + "_cur", 0) or 0
+            if cur != last_cur:
+                last_cur, last_change = cur, time.time()
+            elif time.time() - last_change > STALL_SECONDS:
+                raise TimeoutError(f"no progress for {STALL_SECONDS}s (dead connection)")
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+
+
+async def run_transfer(make_coro, prefix, attempts=3):
+    """Runs a transfer with the stall guard, retrying a few times if it stalls."""
+    last = None
+    for _ in range(attempts):
+        try:
+            return await with_stall_guard(make_coro(), prefix)
+        except FloodWaitError:
+            raise
+        except TimeoutError as e:
+            last = e
+            reset_dir(prefix)
+            await asyncio.sleep(2)
+    raise last
+
+
 async def prepare_group(group, opts):
     """Downloads whatever must be re-uploaded (nothing for a direct server-side copy).
     Runs ahead of sending so the next file downloads while the current one uploads."""
@@ -925,8 +971,11 @@ async def prepare_group(group, opts):
                     tmp = tmp or tempfile.mkdtemp(prefix="cp_", dir=DOWNLOAD_DIR)
                     files = []
                     for i, m in enumerate(media_msgs):
-                        files.append(await download_one(client, m, tmp, i, names, dcb)
-                                     if m.id in reupload else m.media)
+                        if m.id in reupload:
+                            files.append(await run_transfer(
+                                lambda mm=m, ii=i: download_one(client, mm, tmp, ii, names, dcb), "dl"))
+                        else:
+                            files.append(m.media)
                     break
                 except FloodWaitError as e:
                     await wait_flood(e)
@@ -1013,7 +1062,7 @@ async def send_group(dst, group, prepared, opts):
                     await wait_flood(e)
         while True:
             try:
-                await do_upload(client, dst, prepared, opts)
+                await run_transfer(lambda: do_upload(client, dst, prepared, opts), "ul")
                 return True, None, extra_tmp
             except FloodWaitError as e:
                 await wait_flood(e)
