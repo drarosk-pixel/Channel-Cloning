@@ -26,10 +26,11 @@ from telethon.tl.types import (
 )
 
 try:
-    # parallel multi-connection upload (much faster uploads for large files)
-    from FastTelethon import upload_file as fast_upload
+    # parallel multi-connection transfer (much faster up/downloads for large files)
+    from FastTelethon import upload_file as fast_upload, download_file as fast_download
 except Exception:
     fast_upload = None
+    fast_download = None
 
 VERSION = "v10"
 
@@ -109,7 +110,7 @@ class UserSession:
             started=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
             cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
             rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
-            name="", total=0, key="", last_result="", delay=DELAY,
+            name="", total=0, total_msgs=0, key="", last_result="", delay=DELAY,
             force_dl=False, phase_detail="", cur_cur=0, cur_tot=0, cur_speed=0.0,
         )
 
@@ -574,13 +575,21 @@ def render_job():
     lines = [head]
 
     if kind == "copy":
-        total = max(job["top_id"] - job["min_id"], 1)
-        pct = 100.0 if phase == "done" else min(100.0, max(0.0, (job["cur_id"] - job["min_id"]) / total * 100))
+        processed = job["done"] + job["skipped"] + job["failed"]
+        total_c = job.get("total_msgs") or 0
+        if total_c:
+            pct = 100.0 if phase == "done" else min(100.0, processed / total_c * 100)
+        else:
+            span = max(job["top_id"] - job["min_id"], 1)
+            pct = 100.0 if phase == "done" else min(100.0, max(0.0, (job["cur_id"] - job["min_id"]) / span * 100))
         lines.append(f"{job['src']} → {job['dst']}\n")
         lines.append(f"{bar(pct)} {pct:.0f}%")
-        lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
+        if total_c:
+            lines.append(f"Content: {processed} / {total_c}")
+        else:
+            lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
-        # live per-file transfer (download/upload) progress
+        # live per-file transfer (download/upload) progress — this is the accurate speed
         if job["phase_detail"] and job["cur_tot"]:
             p = job["cur_cur"] / job["cur_tot"] * 100
             icon = "⬇️ Downloading" if job["phase_detail"] == "downloading" else "⬆️ Uploading"
@@ -588,12 +597,13 @@ def render_job():
             if job["cur_speed"] > 0:
                 eta_f = (job["cur_tot"] - job["cur_cur"]) / job["cur_speed"]
                 lines.append(f"⚡ {fmt_size(job['cur_speed'])}/s • this file ~{fmt_duration(eta_f)} left")
-        # overall speed
-        if elapsed > 0:
-            mpm = job["done"] / (elapsed / 60)
-            speed = [f"{fmt_size(job['bytes_done'] / elapsed)}/s"] if job["bytes_done"] else []
-            speed.append(f"{mpm:.0f} msg/min")
-            lines.append(f"Speed: {' • '.join(speed)}  ({fmt_size(job['bytes_done'])} moved)")
+        if job["force_dl"]:
+            # download/upload mode: the per-file speed above is the real one; show total moved
+            if job["bytes_done"]:
+                lines.append(f"Total moved: {fmt_size(job['bytes_done'])}")
+        elif elapsed > 0:
+            # server-side copy: message throughput
+            lines.append(f"Speed: {job['done'] / (elapsed / 60):.0f} msg/min")
         eta = ""
         if phase == "running" and pct >= 2 and elapsed > 20:
             eta = f" | ETA: ~{fmt_duration(elapsed * (100 - pct) / pct)}"
@@ -667,6 +677,17 @@ def doc_attrs(m, path):
     attrs = [a for a in (doc.attributes if doc else []) if not isinstance(a, DocumentAttributeFilename)]
     attrs.append(DocumentAttributeFilename(os.path.basename(path)))
     return attrs, getattr(doc, "mime_type", None)
+
+
+async def try_src_thumb(m):
+    """Downloads the source message's own thumbnail so re-uploaded videos keep their preview."""
+    doc = getattr(m, "document", None)
+    if not doc or not getattr(doc, "thumbs", None):
+        return None
+    try:
+        return await m.download_media(file=tempfile.mktemp(suffix=".jpg"), thumb=-1)
+    except Exception:
+        return None
 
 
 async def send_item(dst, msgs, opts):
@@ -743,24 +764,40 @@ async def send_item(dst, msgs, opts):
             raw, ents = caps[0]
             m0 = media_msgs[0]
             f0 = files[0]
-            thumb_kw = {"thumb": thumb} if (thumb and is_doc(m0)) else {}
-            # parallel multi-connection upload for large downloaded files (much faster)
-            if (fast_upload is not None and isinstance(f0, str)
-                    and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
-                try:
-                    with open(f0, "rb") as fh:
-                        input_file = await fast_upload(client, fh, progress_callback=cb_factory("uploading"))
-                    attrs, mime = doc_attrs(m0, f0)
-                    await client.send_file(dst, input_file, caption=raw, attributes=attrs,
-                                           mime_type=mime, **ent_kw(ents), **thumb_kw)
-                    return
-                except FloodWaitError:
-                    raise
-                except Exception:
-                    pass  # fall back to the normal single-connection upload
-            await client.send_file(dst, f0, caption=raw,
-                                   progress_callback=cb_factory("uploading"),
-                                   **ent_kw(ents), **thumb_kw, **extra)
+            # pick a thumbnail: custom one if set, otherwise keep the source's own preview
+            own_thumb = None
+            thumb_file = None
+            if is_doc(m0) and isinstance(f0, str):
+                if thumb:
+                    thumb_file = thumb
+                else:
+                    own_thumb = await try_src_thumb(m0)
+                    thumb_file = own_thumb
+            thumb_kw = {"thumb": thumb_file} if thumb_file else {}
+            try:
+                # parallel multi-connection upload for large downloaded files (much faster)
+                if (fast_upload is not None and isinstance(f0, str)
+                        and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
+                    try:
+                        with open(f0, "rb") as fh:
+                            input_file = await fast_upload(client, fh, progress_callback=cb_factory("uploading"))
+                        attrs, mime = doc_attrs(m0, f0)
+                        await client.send_file(dst, input_file, caption=raw, attributes=attrs,
+                                               mime_type=mime, **ent_kw(ents), **thumb_kw)
+                        return
+                    except FloodWaitError:
+                        raise
+                    except Exception:
+                        pass  # fall back to the normal single-connection upload
+                await client.send_file(dst, f0, caption=raw,
+                                       progress_callback=cb_factory("uploading"),
+                                       **ent_kw(ents), **thumb_kw, **extra)
+            finally:
+                if own_thumb and os.path.exists(own_thumb):
+                    try:
+                        os.remove(own_thumb)
+                    except Exception:
+                        pass
         else:
             any_ents = any(e for _, e in caps)
             if any_ents:
@@ -781,6 +818,17 @@ async def send_item(dst, msgs, opts):
         sub = os.path.join(tmp, str(i))
         os.makedirs(sub, exist_ok=True)
         dcb = cb_factory("downloading")
+        size = getattr(getattr(m, "file", None), "size", None) or 0
+        # parallel multi-connection download for large files
+        if fast_download is not None and is_doc(m) and size >= FAST_MIN:
+            try:
+                fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
+                path = os.path.join(sub, fname)
+                with open(path, "wb") as out:
+                    await fast_download(client, m.document, out, progress_callback=dcb)
+                return path
+            except Exception:
+                pass  # fall back to the normal download
         if m.id in names:
             return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
         return await m.download_media(file=sub + os.sep, progress_callback=dcb)
@@ -860,6 +908,10 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         # protected/private source: skip the pointless direct-copy attempt, download+upload directly
         if getattr(src, "noforwards", False):
             job["force_dl"] = True
+        try:
+            job["total_msgs"] = getattr(await client.get_messages(src, limit=0), "total", 0) or 0
+        except Exception:
+            job["total_msgs"] = 0
         latest = await client.get_messages(src, limit=1)
         job["top_id"] = max(latest[0].id if latest else min_id, min_id)
         status = await say("▶️ Copy started…")
