@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import sys
@@ -24,6 +25,7 @@ from telethon.tl.types import (
     MessageMediaWebPage, MessageMediaPoll, Channel, PeerChannel,
     BotCommand, BotCommandScopeDefault,
     DocumentAttributeFilename, DocumentAttributeVideo,
+    PhotoSize, PhotoSizeProgressive, InputDocumentFileLocation,
 )
 
 try:
@@ -714,20 +716,102 @@ def is_video(m):
 def doc_attrs(m, path):
     """Original document attributes, with the filename set to the (possibly renamed) file."""
     doc = getattr(m, "document", None)
-    attrs = [a for a in (doc.attributes if doc else []) if not isinstance(a, DocumentAttributeFilename)]
+    attrs = []
+    for a in (doc.attributes if doc else []):
+        if isinstance(a, DocumentAttributeFilename):
+            continue
+        if isinstance(a, DocumentAttributeVideo):
+            a = copy.copy(a)
+            a.supports_streaming = True  # keep the video playable while it loads
+        attrs.append(a)
     attrs.append(DocumentAttributeFilename(os.path.basename(path)))
     return attrs, getattr(doc, "mime_type", None)
 
 
-async def try_src_thumb(m):
-    """Downloads the source message's own thumbnail so re-uploaded videos keep their preview."""
-    doc = getattr(m, "document", None)
-    if not doc or not getattr(doc, "thumbs", None):
-        return None
+def _best_thumb_size(doc):
+    """Largest real JPEG thumbnail of a document (PhotoSize or PhotoSizeProgressive)."""
+    best, best_px = None, -1
+    for t in (getattr(doc, "thumbs", None) or []):
+        if isinstance(t, (PhotoSize, PhotoSizeProgressive)):
+            px = (getattr(t, "w", 0) or 0) * (getattr(t, "h", 0) or 0)
+            if px > best_px:
+                best, best_px = t, px
+    return best
+
+
+def _save_thumb_bytes(data, dst):
+    """Writes thumbnail bytes as a Telegram-friendly JPEG (<=320px, small)."""
     try:
-        return await m.download_media(file=tempfile.mktemp(suffix=".jpg", dir=DOWNLOAD_DIR), thumb=-1)
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            im.save(dst, "JPEG", quality=85)
+        return True
     except Exception:
+        try:
+            with open(dst, "wb") as f:
+                f.write(data)
+            return True
+        except Exception:
+            return False
+
+
+async def _thumb_from_video(path, dst):
+    """Grabs a frame from the video with ffmpeg (only if ffmpeg is installed on the host)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not path or not os.path.exists(path):
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-loglevel", "error", "-ss", "5", "-i", path,
+            "-frames:v", "1", "-vf", "scale=320:-2", dst,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(proc.wait(), timeout=60)
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
+async def try_src_thumb(client, m, video_path=None):
+    """Gets a thumbnail for a re-uploaded video/document so it keeps its preview.
+    Downloads the source thumbnail directly (Telethon's own helper crashes on the
+    PhotoSizeProgressive format Telegram now uses), retries once with a fresh file
+    reference, and falls back to a frame from the video if ffmpeg is available."""
+    doc = getattr(m, "document", None)
+    if not doc:
         return None
+    dst = tempfile.mktemp(suffix=".jpg", dir=DOWNLOAD_DIR)
+    reason = "source has no thumbnail"
+    for attempt in range(2):
+        size = _best_thumb_size(doc)
+        if size is None:
+            break
+        try:
+            loc = InputDocumentFileLocation(id=doc.id, access_hash=doc.access_hash,
+                                            file_reference=doc.file_reference, thumb_size=size.type)
+            data = await client.download_file(loc, bytes, dc_id=doc.dc_id)
+            if data and _save_thumb_bytes(data, dst):
+                return dst
+            reason = "empty thumbnail"
+        except FloodWaitError:
+            raise
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            if attempt == 0:
+                # the file reference may have expired during a long download: refetch the message
+                try:
+                    fresh = await client.get_messages(m.peer_id, ids=m.id)
+                    if fresh and getattr(fresh, "document", None):
+                        doc = fresh.document
+                        continue
+                except Exception:
+                    pass
+            break
+    if await _thumb_from_video(video_path, dst):
+        return dst
+    print(f"Thumbnail not copied for message {m.id}: {reason}")
+    return None
 
 
 def xfer_cb(prefix):
@@ -872,7 +956,7 @@ async def do_upload(client, dst, prepared, opts):
             if thumb:
                 thumb_file = thumb
             else:
-                own_thumb = await try_src_thumb(m0)
+                own_thumb = await try_src_thumb(client, m0, f0)
                 thumb_file = own_thumb
         thumb_kw = {"thumb": thumb_file} if thumb_file else {}
         try:
