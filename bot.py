@@ -1413,6 +1413,12 @@ def build_opts(conv):
             "thumb": conv["thumb"], "footer": footer}
 
 
+async def _run_in_session(sess, coro):
+    # the background job runs in its own task; set the session here so S() always works
+    _cur.set(sess)
+    await coro
+
+
 def start_copy_job():
     sess = S()
     conv = sess.conv
@@ -1422,7 +1428,7 @@ def start_copy_job():
     set_setting("last_dst", {"ref": conv["dst"], "title": conv["dst_title"]})
     sess.reset_conv()
     sess.job["running"] = True
-    asyncio.create_task(run_copy(*args))
+    asyncio.create_task(_run_in_session(sess, run_copy(*args)))
 
 
 def start_create_job():
@@ -1430,7 +1436,7 @@ def start_create_job():
     name, count = sess.conv["name"], sess.conv["count"]
     sess.reset_conv()
     sess.job["running"] = True
-    asyncio.create_task(run_create(name, count))
+    asyncio.create_task(_run_in_session(sess, run_create(name, count)))
 
 
 # ----------------------------- guided copy flow -----------------------------
