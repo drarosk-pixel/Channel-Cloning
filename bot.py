@@ -954,9 +954,10 @@ def build_pick(kind, header):
         tp = (len(items) + PICK_PAGE - 1) // PICK_PAGE
         tail = (f"\n\n👇 Tap a channel (page {page + 1}/{tp}). "
                 "Lots of channels? Just type part of the name to search. "
-                "You can also send an @username or forward a message.")
+                "You can also send a channel ID (-100…), an @username, or forward a message.")
     else:
-        tail = "\n\nType part of a channel's name to search, or send an @username, or forward a message from it."
+        tail = ("\n\nType part of a channel's name to search, or send a channel ID (-100…) "
+                "or @username, or forward a message from it.")
     return header + tail, rows
 
 
@@ -964,7 +965,8 @@ def src_header():
     return ("📥 Step 1 of 4 — Source channel (copy FROM)\n\n"
             "This can be someone else's channel — it does NOT have to be yours.\n"
             "• Pick a channel you've joined from the buttons below, or\n"
-            "• For any public channel, send its @username or t.me link, or\n"
+            "• Send a channel ID (private channels look like -1001234567890), or\n"
+            "• For a public channel, send its @username or t.me link, or\n"
             "• Forward any message from the channel to me.")
 
 
@@ -1009,9 +1011,14 @@ async def handle_channel_text(kind, text, fwd):
     tokens = text.split()
     ref = None
     if len(tokens) == 1:
+        tok = tokens[0]
         try:
-            ref = check_ref(tokens[0], label)
-        except BadInput:
+            ref = check_ref(tok, label)
+        except BadInput as e:
+            # if it clearly looks like an ID/username attempt, show the hint instead of searching
+            if re.match(r"^(@|-|\d|https?://|t\.me)", tok):
+                await say(f"❌ {e}\n\nYou can also type part of the channel's name to search for it.")
+                return
             ref = None
     if ref is not None:
         if await setfn(ref):
