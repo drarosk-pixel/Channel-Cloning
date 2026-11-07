@@ -5,7 +5,16 @@ A multi-user Telegram assistant bot. Users chat with one bot (created via
 account using `/login`. The bot then works on each user's behalf to:
 
 - **Copy** all content (videos, photos, files, text) from one channel to another,
-  optionally replacing words in captions and file names.
+  with optional extras:
+  - **Replace words** in captions/text and/or file names.
+  - **Replace links** — rewrite the hidden URL inside hyperlinks (e.g.
+    `t.me/oldchannel` → `t.me/newchannel`).
+  - **Custom thumbnail** — upload a photo to use as the thumbnail for copied
+    videos/documents.
+  - **Caption / promo link** — add extra text (and a clickable promo link) to
+    every caption, appended or prepended.
+  - **Live speed** — `/status` shows transfer speed and messages/min with a
+    progress bar and ETA.
 - **Create** several private channels with the same name in one go.
 
 Earlier versions needed a single `SESSION_STRING` so only the owner could use the
@@ -30,6 +39,7 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `DELAY` | no | `1.5` | Seconds between copied messages |
 | `EDIT_EVERY` | no | `4` | Seconds between live status updates |
 | `SESSIONS_FILE` | no | `sessions.json` | Where logged-in sessions are stored |
+| `THUMB_DIR` | no | `thumbs` | Folder for per-user custom thumbnails |
 | `PROGRESS_FILE` | no | `progress.json` | Per-user copy progress |
 | `SETTINGS_FILE` | no | `settings.json` | Per-user saved settings |
 
