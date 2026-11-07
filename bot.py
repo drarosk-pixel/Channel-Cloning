@@ -58,7 +58,7 @@ RESTRICT = os.environ.get("RESTRICT", "1") == "1"            # channels created 
 MAX_COUNT = int(os.environ.get("MAX_COUNT", "50"))           # max channels per /create
 CREATE_DELAY = float(os.environ.get("CREATE_DELAY", "3"))    # wait between created channels
 DELAY = float(os.environ.get("DELAY", "1.5"))                # wait between copied messages
-EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "4"))        # seconds between live status updates
+EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "6"))        # seconds between live status updates
 PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
@@ -1204,13 +1204,14 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     ticker_task = None
 
     async def progress_ticker():
-        # keeps /status live: download/upload progress and the flood-wait countdown
+        # keeps /status live. Only force an edit during a flood countdown; otherwise respect
+        # EDIT_EVERY so we don't edit the message so often that Telegram rate-limits the bot
+        # (which made it respond to other commands late).
         try:
             while job["running"]:
-                force = (job["flood_until"] > time.time()
-                         or job["dl_tot"] > 0 or job["ul_tot"] > 0)
+                force = job["flood_until"] > time.time()
                 await refresh(status, force=force)
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
         except asyncio.CancelledError:
             pass
 
@@ -2487,8 +2488,10 @@ async def main():
     except Exception as e:
         print(f"WARN: get_me failed ({e})", flush=True)
         uname = "?"
-    # connected — now quiet the per-transfer connection noise
+    # connected — now quiet the per-transfer connection noise, and stop the bot from sleeping a
+    # long time on its own flood waits (e.g. frequent status edits) which made it respond late
     logging.getLogger("telethon").setLevel(logging.ERROR)
+    bot.flood_sleep_threshold = 30
     print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
     print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
     # set the command menu in the background so it can never hold up startup
