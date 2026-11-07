@@ -142,7 +142,7 @@ class UserSession:
         self.conv.update(
             kind=None, step=None,
             src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
-            start=None, start_label="",
+            start=None, start_label="", base_done=0,
             rules=[], scope="both", link_rules=[],
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
@@ -163,6 +163,7 @@ class UserSession:
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, paused=False, pending_id=0, fast_note="", refresh_refs=False,
+            base_done=0,
         )
 
 
@@ -207,14 +208,23 @@ def save_sessions():
     jsave(SESSIONS_FILE, session_strings)
 
 
-def save_progress(key, last_id):
+def save_progress(key, last_id, count=0):
     data = jload(PROGRESS_FILE)
-    data.setdefault(str(S().user_id), {})[key] = last_id
+    data.setdefault(str(S().user_id), {})[key] = {"id": last_id, "n": count}
     jsave(PROGRESS_FILE, data)
 
 
 def progress_map():
     return jload(PROGRESS_FILE).get(str(S().user_id), {})
+
+
+def progress_entry(key):
+    """(last message id, how many were already copied). Older progress files stored
+    just the id, so handle both shapes."""
+    v = progress_map().get(key)
+    if isinstance(v, dict):
+        return int(v.get("id") or 0), int(v.get("n") or 0)
+    return int(v or 0), 0
 
 
 def get_setting(name, default=None):
@@ -626,7 +636,7 @@ def render_job():
     lines = [head]
 
     if kind == "copy":
-        processed = job["done"] + job["skipped"] + job["failed"]
+        processed = done_count(job)
         total_c = job.get("total_msgs") or 0
         if total_c:
             pct = 100.0 if phase == "done" else min(100.0, processed / total_c * 100)
@@ -1161,6 +1171,12 @@ async def send_group(dst, group, prepared, opts):
         reset_dir("ul")
 
 
+def done_count(job):
+    """Items finished including ones copied before a resume, so the count and the
+    percentage keep going up across resumes instead of restarting at zero."""
+    return job.get("base_done", 0) + job["done"] + job["skipped"] + job["failed"]
+
+
 def group_bytes(group):
     return sum((getattr(getattr(m, "file", None), "size", None) or 0) for m in group)
 
@@ -1270,7 +1286,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                rules_n=len(rules.pairs) if rules else 0, scope=opts["scope"],
                link_n=len(opts["link_rules"].pairs) if opts["link_rules"] else 0,
                has_thumb=bool(opts["thumb"]), has_footer=bool(opts["footer"]),
-               delay=get_delay())
+               delay=get_delay(), base_done=opts.get("base_done") or 0)
     status = None
     ticker_task = None
 
@@ -1314,7 +1330,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                 enq = [0]
 
                 async def enqueue(g):
-                    job["dl_no"] = enq[0] + 1
+                    job["dl_no"] = job.get("base_done", 0) + enq[0] + 1
                     enq[0] += len(g)
                     try:
                         prepared = await prepare_group(g, opts)
@@ -1347,11 +1363,11 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                         break
                     group, prepared = item
                     last_id = group[-1].id
-                    job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                    job["ul_no"] = done_count(job) + 1
                     arg = None if (isinstance(prepared, dict) and "__error__" in prepared) else prepared
                     await process_with_retry(dst, group, opts, prepared=arg)
                     job["cur_id"] = last_id
-                    save_progress(job["key"], last_id)
+                    save_progress(job["key"], last_id, done_count(job))
                     if job["stop"]:
                         break
                     try:
@@ -1382,10 +1398,10 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                     return
                 g, group = group, []
                 last_id = g[-1].id
-                job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                job["dl_no"] = job["ul_no"] = done_count(job) + 1
                 await process_with_retry(dst, g, opts)
                 job["cur_id"] = last_id
-                save_progress(job["key"], last_id)
+                save_progress(job["key"], last_id, done_count(job))
                 try:
                     await asyncio.sleep(job["delay"])
                     await refresh(status)
@@ -1487,7 +1503,8 @@ def build_opts(conv):
         ftext, fents = tl_markdown.parse(conv["footer_text"])
         footer = (ftext, fents, conv["footer_pos"])
     return {"rules": rules, "scope": conv["scope"] or "both", "link_rules": link_rules,
-            "thumb": conv["thumb"], "footer": footer}
+            "thumb": conv["thumb"], "footer": footer,
+            "base_done": conv.get("base_done") or 0}
 
 
 async def _run_in_session(sess, coro):
@@ -1664,10 +1681,11 @@ async def ask_start():
     conv = S().conv
     conv["step"] = "start"
     key = f"{conv['src_id']}->{conv['dst_id']}"
-    last_id = progress_map().get(key, 0)
+    last_id, done_n = progress_entry(key)
     rows = [[Button.inline("⏮ From the beginning", b"start:begin")]]
     if last_id:
-        rows.append([Button.inline(f"⏯ Resume (after message ID {last_id})", b"start:resume")])
+        label = f"⏯ Resume ({done_n} already copied)" if done_n else f"⏯ Resume (after message ID {last_id})"
+        rows.append([Button.inline(label, b"start:resume")])
     await say(f"✅ Destination: {conv['dst_title']}\n\n"
               "📍 Step 3 of 4 — Starting point\n\n"
               "Choose where to start, or send a message ID to start from that message.", buttons=rows)
@@ -2411,11 +2429,13 @@ async def on_button(event):
         elif data in ("start:begin", "start:resume") and step == "start":
             await event.answer()
             if data == "start:begin":
-                conv.update(start=0, start_label="the beginning")
+                conv.update(start=0, start_label="the beginning", base_done=0)
             else:
                 key = f"{conv['src_id']}->{conv['dst_id']}"
-                last_id = progress_map().get(key, 0)
-                conv.update(start=last_id, start_label=f"resuming after message ID {last_id}")
+                last_id, done_n = progress_entry(key)
+                conv.update(start=last_id, base_done=done_n,
+                            start_label=f"resuming after message ID {last_id}"
+                                        + (f" ({done_n} already copied)" if done_n else ""))
             await event.edit(f"Start: {conv['start_label']}")
             await copy_next()
         # ----- extras hub -----
