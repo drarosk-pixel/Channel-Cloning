@@ -101,7 +101,7 @@ class UserSession:
             started=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
             cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
             rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
-            name="", total=0, key="", last_result="",
+            name="", total=0, key="", last_result="", delay=DELAY,
         )
 
 
@@ -164,6 +164,15 @@ def set_setting(name, value):
     data = jload(SETTINGS_FILE)
     data.setdefault(str(S().user_id), {})[name] = value
     jsave(SETTINGS_FILE, data)
+
+
+def get_delay():
+    """Per-user delay (seconds) between copied messages; defaults to the DELAY env var."""
+    try:
+        v = float(get_setting("delay", DELAY))
+    except Exception:
+        v = DELAY
+    return min(10.0, max(0.3, v))
 
 
 # ----------------------------- small helpers -----------------------------
@@ -254,6 +263,7 @@ HELP = (
     "/copy - Copy content from one channel to another (guided)\n"
     "/create - Create multiple private channels (guided)\n"
     "/status - Live progress (with speed) of your current task\n"
+    "/speed - Set the delay between messages (e.g. /speed 0.8)\n"
     "/errors - Detailed list of recent errors\n"
     "/stop - Stop your current task (or discard a draft)\n"
     "/ping - Check that I'm online\n"
@@ -290,7 +300,10 @@ HELP = (
     "Good to know\n"
     "• Your account must be a member of the source and an admin of the destination.\n"
     "• Only one task runs at a time per user.\n"
-    "• A stopped or failed copy can be resumed from where it left off."
+    "• A stopped or failed copy can be resumed from where it left off.\n"
+    "• Speed: use /speed to lower the delay (e.g. 0.8s). If Telegram pauses you "
+    "(flood wait), /status shows a live countdown and the copy resumes automatically "
+    "from the same message when the wait ends."
 )
 
 ABOUT = (
@@ -586,7 +599,10 @@ def render_job():
         lines.append(f"Elapsed: {fmt_duration(elapsed)}")
 
     if phase == "running" and job["flood_until"] > time.time():
-        lines.append(f"⏳ Telegram asked me to wait {int(job['flood_until'] - time.time())}s (flood wait)")
+        remaining = int(job["flood_until"] - time.time()) + 1
+        lines.append(f"⏳ Paused by Telegram (flood wait): resuming in {remaining}s…")
+        if kind == "copy":
+            lines.append(f"   Will continue right after message ID {job['cur_id']}.")
 
     if job["errors"]:
         lines.append(f"\n⚠️ Errors: {len(job['errors'])}")
@@ -744,8 +760,23 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                cur_id=min_id, min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
                rules_n=len(rules.pairs) if rules else 0, scope=opts["scope"],
                link_n=len(opts["link_rules"].pairs) if opts["link_rules"] else 0,
-               has_thumb=bool(opts["thumb"]), has_footer=bool(opts["footer"]))
+               has_thumb=bool(opts["thumb"]), has_footer=bool(opts["footer"]),
+               delay=get_delay())
     status = None
+    ticker_task = None
+
+    async def flood_ticker():
+        # keeps the live flood-wait countdown updating while Telegram makes us wait
+        try:
+            while job["running"]:
+                if job["flood_until"] > time.time():
+                    await refresh(status, force=True)
+                    await asyncio.sleep(2)
+                else:
+                    await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
     try:
         src = await resolve(src_ref, "Source channel")
         dst = await resolve(dst_ref, "Destination channel")
@@ -754,6 +785,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         job["top_id"] = max(latest[0].id if latest else min_id, min_id)
         status = await say("▶️ Copy started…")
         await refresh(status, force=True)
+        ticker_task = asyncio.create_task(flood_ticker())
 
         group = []
 
@@ -774,7 +806,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
             job["cur_id"] = last_id
             save_progress(job["key"], last_id)
             group = []
-            await asyncio.sleep(DELAY)
+            await asyncio.sleep(job["delay"])
             await refresh(status)
 
         async for m in client.iter_messages(src, reverse=True, min_id=min_id):
@@ -809,6 +841,8 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     finally:
         job["running"] = False
         job["flood_until"] = 0.0
+        if ticker_task is not None:
+            ticker_task.cancel()
         job["last_result"] = render_job()
         if status is not None:
             await refresh(status, force=True)
@@ -1449,6 +1483,28 @@ async def cmd_logout(arg):
     await say("👋 Logged out. Your session has been removed from the bot.\nSend /login to connect again.")
 
 
+async def cmd_speed(arg):
+    arg = arg.strip().replace(",", ".")
+    if not arg:
+        await say(f"⚡ Delay between copied messages: {get_delay()}s.\n\n"
+                  "Change it with: /speed <seconds>  (e.g. /speed 0.8)\n"
+                  "Lower = faster, but too low makes Telegram pause you (flood wait).\n"
+                  "Allowed range: 0.3 – 10 seconds. Applies to your next copy.")
+        return
+    try:
+        v = float(arg)
+    except ValueError:
+        await say("❌ Please send a number, e.g. /speed 0.8")
+        return
+    if not (0.3 <= v <= 10):
+        await say("❌ Please choose a value between 0.3 and 10 seconds.")
+        return
+    set_setting("delay", v)
+    note = "\n⚠️ That's quite fast — if you start seeing flood waits, raise it a little." if v < 1 else ""
+    await say(f"✅ Delay set to {v}s between messages." + note +
+              ("\n(A copy is running now — this takes effect on your next copy.)" if S().job["running"] else ""))
+
+
 async def cmd_status(arg):
     sess = S()
     if sess.job["running"] or sess.job["kind"]:
@@ -1547,7 +1603,7 @@ async def cmd_create(arg):
 COMMANDS = {
     "/start": cmd_start, "/help": cmd_help, "/login": cmd_login, "/logout": cmd_logout,
     "/copy": cmd_copy, "/create": cmd_create, "/status": cmd_status, "/errors": cmd_errors,
-    "/stop": cmd_stop, "/cancel": cmd_stop, "/ping": cmd_ping, "/about": cmd_about,
+    "/speed": cmd_speed, "/stop": cmd_stop, "/cancel": cmd_stop, "/ping": cmd_ping, "/about": cmd_about,
 }
 
 
@@ -1853,6 +1909,7 @@ async def main():
                 BotCommand("copy", "Copy a channel (guided)"),
                 BotCommand("create", "Create multiple channels"),
                 BotCommand("status", "Live progress"),
+                BotCommand("speed", "Set delay between messages"),
                 BotCommand("errors", "Detailed error list"),
                 BotCommand("stop", "Stop the current task"),
                 BotCommand("ping", "Check that the bot is online"),
