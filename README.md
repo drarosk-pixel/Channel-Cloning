@@ -40,7 +40,8 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `EDIT_EVERY` | no | `4` | Seconds between live status updates |
 | `SESSIONS_FILE` | no | `sessions.json` | Where logged-in sessions are stored |
 | `THUMB_DIR` | no | `thumbs` | Folder for per-user custom thumbnails |
-| `FAST_UPLOAD_MB` | no | `5` | Files larger than this use parallel multi-connection upload |
+| `FAST_UPLOAD_MB` | no | `5` | Files larger than this use parallel multi-connection transfer |
+| `FT_CONNECTIONS` | no | `8` | Parallel connections per transfer (lower = more stable on small hosts) |
 | `PROGRESS_FILE` | no | `progress.json` | Per-user copy progress |
 | `SETTINGS_FILE` | no | `settings.json` | Per-user saved settings |
 
