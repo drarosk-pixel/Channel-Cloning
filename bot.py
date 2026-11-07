@@ -835,17 +835,24 @@ async def prepare_group(group, opts):
     tmp = None
     if reupload:
         dcb = xfer_cb("dl")
-        while True:
-            try:
-                tmp = tmp or tempfile.mkdtemp(prefix="cp_", dir=DOWNLOAD_DIR)
-                files = []
-                for i, m in enumerate(media_msgs):
-                    files.append(await download_one(client, m, tmp, i, names, dcb)
-                                 if m.id in reupload else m.media)
-                break
-            except FloodWaitError as e:
-                await wait_flood(e)
-        reset_dir("dl")
+        try:
+            while True:
+                try:
+                    tmp = tmp or tempfile.mkdtemp(prefix="cp_", dir=DOWNLOAD_DIR)
+                    files = []
+                    for i, m in enumerate(media_msgs):
+                        files.append(await download_one(client, m, tmp, i, names, dcb)
+                                     if m.id in reupload else m.media)
+                    break
+                except FloodWaitError as e:
+                    await wait_flood(e)
+        except BaseException:
+            # a failed/cancelled download must not leave a partial file behind on disk
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        finally:
+            reset_dir("dl")
     else:
         files = [m.media for m in media_msgs]
     return {"media_msgs": media_msgs, "caps": caps, "files": files,
