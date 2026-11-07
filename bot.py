@@ -65,6 +65,9 @@ FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use paral
 # Parallel multi-connection transfer. Greatly speeds up uploads (single-connection uploads are slow).
 # ON by default; set USE_FAST=0 to disable. Harmless connection noise is suppressed below.
 USE_FAST = os.environ.get("USE_FAST", "1") == "1"
+# PIPELINE=1: download the next file while uploading the current one (uses both directions, ~2x).
+# PIPELINE=0: strictly one at a time (download, then upload). Connection warnings are silenced either way.
+PIPELINE = os.environ.get("PIPELINE", "1") == "1"
 
 
 # ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
@@ -992,54 +995,133 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
 
-        # sequential: fully download a group, then fully upload it (one transfer at a time).
-        # This keeps the connection count low so FastTelethon stays stable (no auth/connection noise).
-        group = []
+        if PIPELINE:
+            # overlap: a producer downloads the next group while the consumer uploads the current one
+            queue = asyncio.Queue(maxsize=1)
+            STOP = object()
 
-        async def flush():
-            nonlocal group
-            if not group:
-                return
-            job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
-            last_id = group[-1].id
+            async def producer():
+                group = []
+                enq = [0]
+
+                async def enqueue(g):
+                    job["dl_no"] = enq[0] + 1
+                    enq[0] += len(g)
+                    try:
+                        prepared = await prepare_group(g, opts)
+                    except Exception as e:
+                        prepared = {"__error__": e, "tmp": None}
+                    await queue.put((g, prepared))
+
+                try:
+                    async for m in client.iter_messages(src, reverse=True, min_id=min_id):
+                        if job["stop"]:
+                            break
+                        if m.action:
+                            continue
+                        if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                            group.append(m)
+                            continue
+                        if group:
+                            await enqueue(group)
+                        group = [m]
+                    if group and not job["stop"]:
+                        await enqueue(group)
+                finally:
+                    await queue.put(STOP)
+
+            prod = asyncio.create_task(producer())
             try:
-                prepared = await prepare_group(group, opts)   # download step
-            except Exception as e:
-                prepared = {"__error__": e, "tmp": None}
-            if isinstance(prepared, dict) and "__error__" in prepared:
-                job["failed"] += len(group)
-                record_error(f"message ID {last_id}", prepared["__error__"])
-            else:
-                sent, err, extra_tmp = await send_group(dst, group, prepared, opts)   # upload step
-                clean_tmp(prepared)
-                if extra_tmp:
-                    shutil.rmtree(extra_tmp, ignore_errors=True)
-                if err is not None:
-                    job["failed"] += len(group)
-                    record_error(f"message ID {last_id}", err)
-                elif sent:
-                    job["done"] += len(group)
-                    job["bytes_done"] += group_bytes(group)
-                else:
-                    job["skipped"] += len(group)
-            job["cur_id"] = last_id
-            save_progress(job["key"], last_id)
+                while True:
+                    item = await queue.get()
+                    if item is STOP:
+                        break
+                    group, prepared = item
+                    last_id = group[-1].id
+                    if isinstance(prepared, dict) and "__error__" in prepared:
+                        job["failed"] += len(group)
+                        record_error(f"message ID {last_id}", prepared["__error__"])
+                    else:
+                        job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                        sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+                        clean_tmp(prepared)
+                        if extra_tmp:
+                            shutil.rmtree(extra_tmp, ignore_errors=True)
+                        if err is not None:
+                            job["failed"] += len(group)
+                            record_error(f"message ID {last_id}", err)
+                        elif sent:
+                            job["done"] += len(group)
+                            job["bytes_done"] += group_bytes(group)
+                        else:
+                            job["skipped"] += len(group)
+                    job["cur_id"] = last_id
+                    save_progress(job["key"], last_id)
+                    if job["stop"]:
+                        break
+                    await asyncio.sleep(job["delay"])
+                    await refresh(status)
+            finally:
+                prod.cancel()
+                try:
+                    await prod
+                except BaseException:
+                    pass
+                while not queue.empty():
+                    try:
+                        it = queue.get_nowait()
+                    except Exception:
+                        break
+                    if isinstance(it, tuple):
+                        clean_tmp(it[1])
+        else:
+            # sequential: download a group fully, then upload it (one transfer at a time)
             group = []
-            await asyncio.sleep(job["delay"])
-            await refresh(status)
 
-        async for m in client.iter_messages(src, reverse=True, min_id=min_id):
-            if job["stop"]:
-                break
-            if m.action:
-                continue
-            if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
-                group.append(m)
-                continue
-            await flush()
-            group = [m]
-        if group and not job["stop"]:
-            await flush()
+            async def flush():
+                nonlocal group
+                if not group:
+                    return
+                job["dl_no"] = job["ul_no"] = job["done"] + job["skipped"] + job["failed"] + 1
+                last_id = group[-1].id
+                try:
+                    prepared = await prepare_group(group, opts)
+                except Exception as e:
+                    prepared = {"__error__": e, "tmp": None}
+                if isinstance(prepared, dict) and "__error__" in prepared:
+                    job["failed"] += len(group)
+                    record_error(f"message ID {last_id}", prepared["__error__"])
+                else:
+                    sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+                    clean_tmp(prepared)
+                    if extra_tmp:
+                        shutil.rmtree(extra_tmp, ignore_errors=True)
+                    if err is not None:
+                        job["failed"] += len(group)
+                        record_error(f"message ID {last_id}", err)
+                    elif sent:
+                        job["done"] += len(group)
+                        job["bytes_done"] += group_bytes(group)
+                    else:
+                        job["skipped"] += len(group)
+                job["cur_id"] = last_id
+                save_progress(job["key"], last_id)
+                group = []
+                await asyncio.sleep(job["delay"])
+                await refresh(status)
+
+            async for m in client.iter_messages(src, reverse=True, min_id=min_id):
+                if job["stop"]:
+                    break
+                if m.action:
+                    continue
+                if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                    group.append(m)
+                    continue
+                await flush()
+                group = [m]
+            if group and not job["stop"]:
+                await flush()
         job["phase"] = "stopped" if job["stop"] else "done"
     except BadInput as e:
         job["phase"] = "error"
