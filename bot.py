@@ -162,7 +162,7 @@ class UserSession:
             force_dl=False,
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
-            pending=None, paused=False, pending_id=0, fast_note="",
+            pending=None, paused=False, pending_id=0, fast_note="", refresh_refs=False,
         )
 
 
@@ -723,6 +723,25 @@ def ent_kw(ents):
     return {"formatting_entities": ents} if ents else {"parse_mode": None}
 
 
+def is_stale_ref(e):
+    """True for Telegram's 'file reference expired' error (checked by name so we don't
+    depend on the error class existing in every Telethon version)."""
+    return ("FILE_REFERENCE" in str(e).upper()
+            or type(e).__name__.startswith("FileReference"))
+
+
+async def fresh_document(client, m):
+    """Re-fetches the message to get a valid file_reference. References go stale on long
+    copies because iter_messages fetched this message in a batch possibly hours ago."""
+    try:
+        fresh = await client.get_messages(m.peer_id, ids=m.id)
+        if fresh and getattr(fresh, "document", None):
+            return fresh.document
+    except Exception:
+        pass
+    return None
+
+
 def why_no_fast(enabled, fn, size):
     """Plain reason the parallel path was skipped, so it shows up in /status."""
     if not enabled:
@@ -903,19 +922,34 @@ async def download_one(client, m, tmp, idx, names, dcb):
     job["dl_cur"] = 0
     if USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN:
         job["dl_mode"] = "fast"
-        try:
-            fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
-            path = os.path.join(sub, fname)
-            with open(path, "wb") as out:
-                await fast_download(client, m.document, out, progress_callback=dcb)
-            job["fast_note"] = ""
-            return path
-        except FloodWaitError:
-            raise
-        except Exception as e:
-            note = f"fast download failed: {type(e).__name__}: {e}"
-            job["fast_note"] = note[:160]
-            print(f"Message {m.id}: {note} -> using normal (slower) download", flush=True)
+        fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
+        path = os.path.join(sub, fname)
+        doc = m.document
+        # once one reference has gone stale, the rest of that batch is stale too, so refresh
+        # up front instead of letting every file fail its first attempt
+        if job.get("refresh_refs"):
+            doc = await fresh_document(client, m) or doc
+        for attempt in range(2):
+            try:
+                with open(path, "wb") as out:
+                    await fast_download(client, doc, out, progress_callback=dcb)
+                job["fast_note"] = ""
+                return path
+            except FloodWaitError:
+                raise
+            except Exception as e:
+                if is_stale_ref(e):
+                    job["refresh_refs"] = True
+                if attempt == 0:
+                    newer = await fresh_document(client, m)
+                    if newer is not None:
+                        doc = newer
+                        job["dl_cur"] = 0      # restart this file's progress
+                        continue
+                note = f"fast download failed: {type(e).__name__}: {e}"
+                job["fast_note"] = note[:160]
+                print(f"Message {m.id}: {note} -> using normal (slower) download", flush=True)
+                break
     else:
         job["fast_note"] = f"fast download off: {why_no_fast(USE_FAST_DL, fast_download, size)}"
     job["dl_mode"] = "normal"
