@@ -32,6 +32,13 @@ log: logging.Logger = logging.getLogger("telethon")
 # (too many makes Telegram drop connections). Override with FT_CONNECTIONS.
 MAX_CONNECTIONS = int(os.environ.get("FT_CONNECTIONS", "8"))
 
+# Telegram allows at most 512 KB per part for both uploads and downloads. Telethon otherwise
+# picks 128 KB (files <=100 MB) or 256 KB (<=750 MB), which means 2-4x more round trips.
+# Using the largest allowed part is a big win when the data centre is far away.
+# Must stay a multiple of 4 KB so it is valid for downloads (4096) and uploads (1024).
+_p = int(os.environ.get("FT_PART_KB", "512"))
+PART_KB = max(4, min(512, _p - _p % 4))
+
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
                      InputFileLocation, InputPhotoFileLocation]
 
@@ -196,7 +203,7 @@ class ParallelTransferrer:
     async def init_upload(self, file_id: int, file_size: int, part_size_kb: Optional[float] = None,
                           connection_count: Optional[int] = None) -> Tuple[int, int, bool]:
         connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+        part_size = int(part_size_kb or PART_KB) * 1024
         part_count = (file_size + part_size - 1) // part_size
         is_large = file_size > 10 * 1024 * 1024
         await self._init_upload(connection_count, file_id, part_count, is_large)
@@ -213,7 +220,7 @@ class ParallelTransferrer:
                        part_size_kb: Optional[float] = None,
                        connection_count: Optional[int] = None) -> AsyncGenerator[bytes, None]:
         connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+        part_size = int(part_size_kb or PART_KB) * 1024
         part_count = math.ceil(file_size / part_size)
         log.debug("Starting parallel download: "
                   f"{connection_count} {part_size} {part_count} {file!s}")
