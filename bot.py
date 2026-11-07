@@ -8,9 +8,13 @@ import shutil
 import struct
 import asyncio
 import tempfile
+import contextvars
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError,
+    PhoneCodeExpiredError, PhoneNumberInvalidError, PasswordHashInvalidError,
+)
 from telethon.extensions import markdown as tl_markdown
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import ToggleNoForwardsRequest
@@ -20,7 +24,7 @@ from telethon.tl.types import (
     BotCommand, BotCommandScopeDefault,
 )
 
-VERSION = "v7"
+VERSION = "v8"
 
 
 def need(name):
@@ -37,7 +41,6 @@ except ValueError:
     print("ERROR: API_ID must be a number (get it from my.telegram.org).")
     sys.exit(1)
 api_hash = need("API_HASH")
-session = need("SESSION_STRING")
 bot_token = need("BOT_TOKEN")
 
 RESTRICT = os.environ.get("RESTRICT", "1") == "1"            # channels created by /create are restricted
@@ -47,44 +50,72 @@ DELAY = float(os.environ.get("DELAY", "1.5"))                # wait between copi
 EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "4"))        # seconds between live status updates
 PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
+SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 
-# `client` = your own Telegram account (does the real work: creating channels, copying content)
-# `bot`    = the BotFather bot you chat with (receives commands and shows progress)
-client = TelegramClient(StringSession(session), api_id, api_hash)
+# `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
+# Each user logs in with /login; their own Telegram account then does the real work.
 bot = TelegramClient(StringSession(), api_id, api_hash)
 bot.parse_mode = None  # bot messages are plain text
-
-my_id = None
-my_name = "there"
-started_at = time.time()
-dialogs_loaded = False
 
 
 class BadInput(Exception):
     pass
 
 
-# ----------------------------- state -----------------------------
-conv = {}
+# ----------------------------- per-user session -----------------------------
+class UserSession:
+    """Everything that belongs to one logged-in (or logging-in) user."""
+
+    def __init__(self, uid):
+        self.user_id = uid
+        self.name = "there"
+        self.client = None          # the user's own Telegram account client
+        self.login_client = None     # temporary client used during /login
+        self.dialogs_loaded = False
+        self.started_at = time.time()
+        self.conv = {}
+        self.job = {}
+        self.reset_conv()
+        self.reset_job()
+
+    def reset_conv(self):
+        self.conv.clear()
+        self.conv.update(
+            kind=None, step=None,
+            src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
+            start=None, start_label="", rules=None, scope=None,
+            name="", count=0,
+            phone=None, phone_code_hash=None,
+        )
+
+    def reset_job(self):
+        self.job.clear()
+        self.job.update(
+            running=False, stop=False, kind=None, phase="idle", last_edit=0.0,
+            started=0.0, src="", dst="", done=0, failed=0, skipped=0,
+            cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
+            rules_n=0, scope="both", name="", total=0, key="", last_result="",
+        )
 
 
-def reset_conv():
-    conv.clear()
-    conv.update(kind=None, step=None,
-                src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
-                start=None, start_label="", rules=None, scope=None,
-                name="", count=0)
+sessions = {}
+_cur = contextvars.ContextVar("current_session")
 
 
-reset_conv()
-
-job = {"running": False, "stop": False, "kind": None, "phase": "idle", "last_edit": 0.0,
-       "started": 0.0, "src": "", "dst": "", "done": 0, "failed": 0, "skipped": 0,
-       "cur_id": 0, "min_id": 0, "top_id": 0, "errors": [], "flood_until": 0.0,
-       "rules_n": 0, "scope": "both", "name": "", "total": 0, "key": "", "last_result": ""}
+def S():
+    """The session for the user currently being served."""
+    return _cur.get()
 
 
-# ----------------------------- small helpers -----------------------------
+def get_sess(uid):
+    s = sessions.get(uid)
+    if s is None:
+        s = UserSession(uid)
+        sessions[uid] = s
+    return s
+
+
+# ----------------------------- persistence -----------------------------
 def jload(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -101,22 +132,34 @@ def jsave(path, data):
         pass
 
 
+session_strings = jload(SESSIONS_FILE)   # {str(user_id): session_string}
+
+
+def save_sessions():
+    jsave(SESSIONS_FILE, session_strings)
+
+
 def save_progress(key, last_id):
     data = jload(PROGRESS_FILE)
-    data[key] = last_id
+    data.setdefault(str(S().user_id), {})[key] = last_id
     jsave(PROGRESS_FILE, data)
 
 
+def progress_map():
+    return jload(PROGRESS_FILE).get(str(S().user_id), {})
+
+
 def get_setting(name, default=None):
-    return jload(SETTINGS_FILE).get(name, default)
+    return jload(SETTINGS_FILE).get(str(S().user_id), {}).get(name, default)
 
 
 def set_setting(name, value):
     data = jload(SETTINGS_FILE)
-    data[name] = value
+    data.setdefault(str(S().user_id), {})[name] = value
     jsave(SETTINGS_FILE, data)
 
 
+# ----------------------------- small helpers -----------------------------
 def fmt_duration(sec):
     sec = int(max(sec, 0))
     h, r = divmod(sec, 3600)
@@ -139,31 +182,75 @@ def bar(pct, width=12):
 
 
 async def say(text, **kw):
-    return await bot.send_message(my_id, text, link_preview=False, **kw)
+    return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+
+
+# ----------------------------- user client lifecycle -----------------------------
+async def ensure_client(sess):
+    """Returns a connected, authorized client for the user, or None if not logged in."""
+    if sess.client is None:
+        ss = session_strings.get(str(sess.user_id))
+        if not ss:
+            return None
+        sess.client = TelegramClient(StringSession(ss), api_id, api_hash)
+    try:
+        if not sess.client.is_connected():
+            await sess.client.connect()
+        if not await sess.client.is_user_authorized():
+            sess.client = None
+            session_strings.pop(str(sess.user_id), None)
+            save_sessions()
+            return None
+    except Exception:
+        return None
+    return sess.client
+
+
+async def require_login(sess):
+    c = await ensure_client(sess)
+    if not c:
+        await say("🔒 You need to log in first.\nSend /login to connect your Telegram account.")
+        return False
+    if sess.name == "there":
+        try:
+            me = await c.get_me()
+            sess.name = me.first_name or "there"
+        except Exception:
+            pass
+    return True
 
 
 # ----------------------------- texts -----------------------------
 WELCOME = (
     "👋 Welcome, {name}!\n\n"
-    "I'm your Channel Tools Assistant. I can:\n"
+    "I'm your Channel Tools Assistant. After you log in with your own Telegram account, I can:\n"
     "• Copy all content (videos, photos, files, text) from one channel to another, "
     "optionally replacing words in captions and file names.\n"
     "• Create several private channels with the same name in one go.\n\n"
-    "Send /copy or /create to begin. I'll guide you step by step.\n"
+    "First send /login to connect your account. Then send /copy or /create.\n"
     "Send /help for the full guide."
 )
 
 HELP = (
     "🤖 Channel Tools Assistant — Help\n\n"
     "Commands\n"
+    "/login - Connect your Telegram account to the bot\n"
+    "/logout - Disconnect your account\n"
     "/copy - Copy content from one channel to another (guided)\n"
     "/create - Create multiple private channels (guided)\n"
-    "/status - Live progress of the current task\n"
+    "/status - Live progress of your current task\n"
     "/errors - Detailed list of recent errors\n"
-    "/stop - Stop the current task (or discard a draft)\n"
+    "/stop - Stop your current task (or discard a draft)\n"
     "/ping - Check that I'm online\n"
     "/about - About this assistant\n"
     "/help - Show this message\n\n"
+    "Logging in\n"
+    "1. Send /login.\n"
+    "2. Send your phone number in international format (e.g. +919876543210).\n"
+    "3. Enter the login code Telegram sends you. Type it with spaces or dashes between the "
+    "digits (e.g. 1 2 3 4 5) so Telegram doesn't block it.\n"
+    "4. If you use two-step verification, enter your password.\n"
+    "Your login lets the bot act on your behalf, so only use a bot you trust.\n\n"
     "Copying content\n"
     "1. Send /copy.\n"
     "2. Send the source channel (ID, @username, or forward any message from it).\n"
@@ -188,16 +275,15 @@ HELP = (
     "You can also simply forward any message from the channel to me and I'll read the ID.\n\n"
     "Good to know\n"
     "• Your account must be a member of the source and an admin of the destination.\n"
-    "• Only one task runs at a time.\n"
+    "• Only one task runs at a time per user.\n"
     "• A stopped or failed copy can be resumed from where it left off.\n"
-    "• Errors are shown in /status together with their error name and code.\n"
-    "• This assistant works only for its owner."
+    "• Errors are shown in /status together with their error name and code."
 )
 
 ABOUT = (
     f"ℹ️ Channel Tools Assistant {VERSION}\n\n"
-    "Copies channel content with optional word replacement (captions and file names) "
-    "and creates multiple channels. Use /help for instructions."
+    "Log in with your own Telegram account, then copy channel content with optional word "
+    "replacement (captions and file names) and create multiple channels. Use /help for instructions."
 )
 
 GREETING_RE = re.compile(r"^(hi+|hello+|hey+|hola|namaste|good\s+(morning|afternoon|evening))\b", re.I)
@@ -224,12 +310,12 @@ def check_ref(token, label):
 
 
 async def resolve(ref, label):
-    global dialogs_loaded
-    if not dialogs_loaded:
-        await client.get_dialogs()
-        dialogs_loaded = True
+    sess = S()
+    if not sess.dialogs_loaded:
+        await sess.client.get_dialogs()
+        sess.dialogs_loaded = True
     try:
-        return await client.get_entity(ref)
+        return await sess.client.get_entity(ref)
     except Exception as e:
         raise BadInput(
             f"{label} could not be found ({ref}).\n"
@@ -346,6 +432,7 @@ def rename_file(name, rules):
 
 # ----------------------------- errors -----------------------------
 def record_error(where, e):
+    job = S().job
     name = e.__class__.__name__
     code = getattr(e, "code", None)
     detail = (str(e) or name).replace("\n", " ")
@@ -355,6 +442,7 @@ def record_error(where, e):
 
 
 def err_lines(limit=5):
+    job = S().job
     agg = {}
     for e in job["errors"]:
         k = (e["name"], e["code"])
@@ -370,6 +458,7 @@ def err_lines(limit=5):
 
 # ----------------------------- status rendering -----------------------------
 def render_job():
+    job = S().job
     kind, phase = job["kind"], job["phase"]
     if kind is None:
         return "✅ No task is running. Send /copy or /create to start one."
@@ -418,6 +507,7 @@ def render_job():
 
 
 async def refresh(status, force=False):
+    job = S().job
     now = time.time()
     if not force and now - job["last_edit"] < EDIT_EVERY:
         return
@@ -435,6 +525,7 @@ def ent_kw(ents):
 
 async def send_item(dst, msgs, rules, scope):
     """Sends one message (or one album). Returns True if something was sent."""
+    client = S().client
     media_msgs = [m for m in msgs
                   if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
     do_text = bool(rules) and scope in ("both", "text")
@@ -510,6 +601,7 @@ async def send_item(dst, msgs, rules, scope):
 
 async def safe_send(dst, group, rules, scope):
     """Returns (sent: bool, error: Exception or None). Waits out FloodWait automatically."""
+    job = S().job
     while True:
         try:
             return await send_item(dst, group, rules, scope), None
@@ -522,6 +614,9 @@ async def safe_send(dst, group, rules, scope):
 
 
 async def run_copy(src_ref, dst_ref, min_id, rules, scope):
+    sess = S()
+    client = sess.client
+    job = sess.job
     job.update(running=True, stop=False, kind="copy", phase="running", started=time.time(),
                last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, cur_id=min_id,
                min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
@@ -602,6 +697,9 @@ async def run_copy(src_ref, dst_ref, min_id, rules, scope):
 
 # ----------------------------- create engine -----------------------------
 async def run_create(name, count):
+    sess = S()
+    client = sess.client
+    job = sess.job
     job.update(running=True, stop=False, kind="create", phase="running", started=time.time(),
                last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0, rules_n=0)
     status = await say("▶️ Channel creation started…")
@@ -642,26 +740,30 @@ async def run_create(name, count):
 
 
 def start_copy_job():
+    sess = S()
+    conv = sess.conv
     pairs = conv["rules"] or []
     rules = Rules(pairs) if pairs else None
     scope = conv["scope"] or "both"
     args = (conv["src"], conv["dst"], conv["start"], rules, scope)
     set_setting("last_src", {"ref": conv["src"], "title": conv["src_title"]})
     set_setting("last_dst", {"ref": conv["dst"], "title": conv["dst_title"]})
-    reset_conv()
-    job["running"] = True
+    sess.reset_conv()
+    sess.job["running"] = True
     asyncio.create_task(run_copy(*args))
 
 
 def start_create_job():
-    name, count = conv["name"], conv["count"]
-    reset_conv()
-    job["running"] = True
+    sess = S()
+    name, count = sess.conv["name"], sess.conv["count"]
+    sess.reset_conv()
+    sess.job["running"] = True
     asyncio.create_task(run_create(name, count))
 
 
 # ----------------------------- guided flows -----------------------------
 async def ask_src():
+    conv = S().conv
     conv["step"] = "src"
     last = get_setting("last_src")
     buttons = [[Button.inline(f"Use last source: {last['title'][:35]}", b"src:last")]] if last else None
@@ -673,6 +775,7 @@ async def ask_src():
 
 
 async def ask_dst():
+    conv = S().conv
     conv["step"] = "dst"
     last = get_setting("last_dst")
     buttons = [[Button.inline(f"Use last destination: {last['title'][:30]}", b"dst:last")]] if last else None
@@ -683,9 +786,10 @@ async def ask_dst():
 
 
 async def ask_start():
+    conv = S().conv
     conv["step"] = "start"
     key = f"{conv['src_id']}->{conv['dst_id']}"
-    last_id = jload(PROGRESS_FILE).get(key, 0)
+    last_id = progress_map().get(key, 0)
     rows = [[Button.inline("⏮ From the beginning", b"start:begin")]]
     if last_id:
         rows.append([Button.inline(f"⏯ Resume (after message ID {last_id})", b"start:resume")])
@@ -695,6 +799,7 @@ async def ask_start():
 
 
 async def ask_rules():
+    conv = S().conv
     conv["step"] = "rules"
     rows = [[Button.inline("⏭ Skip (no changes)", b"rules:skip")]]
     prev = get_setting("rules") or []
@@ -710,6 +815,7 @@ async def ask_rules():
 
 
 async def ask_scope():
+    conv = S().conv
     conv["step"] = "scope"
     await say(f"✅ {len(conv['rules'])} rule(s) saved.\n\nWhere should they be applied?",
               buttons=[[Button.inline("📝 Captions & file names", b"scope:both")],
@@ -718,6 +824,7 @@ async def ask_scope():
 
 
 async def show_copy_confirm():
+    conv = S().conv
     conv["step"] = "confirm"
     rules = conv["rules"] or []
     scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}.get(conv["scope"] or "both")
@@ -740,6 +847,7 @@ async def show_copy_confirm():
 
 
 async def copy_next():
+    conv = S().conv
     if conv["src"] is None:
         await ask_src()
     elif conv["dst"] is None:
@@ -755,6 +863,7 @@ async def copy_next():
 
 
 async def set_src(ref):
+    conv = S().conv
     try:
         ent = await resolve(ref, "Source channel")
     except BadInput as e:
@@ -766,13 +875,15 @@ async def set_src(ref):
 
 
 async def set_dst(ref):
+    sess = S()
+    conv = sess.conv
     try:
         ent = await resolve(ref, "Destination channel")
         if ent.id == conv["src_id"]:
             raise BadInput("The source and destination are the same channel. Please choose a different destination.")
         if isinstance(ent, Channel) and ent.broadcast:
             try:
-                perms = await client.get_permissions(ent)
+                perms = await sess.client.get_permissions(ent)
                 if not (perms.is_creator or perms.is_admin):
                     raise BadInput("Your account is not an admin of the destination channel. "
                                    "Please make it an admin with permission to post, then send the destination again.")
@@ -789,33 +900,126 @@ async def set_dst(ref):
 
 
 def set_start_from_id(n):
+    conv = S().conv
     conv["start"] = max(0, n - 1)
     conv["start_label"] = f"message ID {n}" if n > 0 else "the beginning"
 
 
 async def ask_create_name():
+    conv = S().conv
     conv["step"] = "c_name"
     await say("🆕 Step 1 of 2 — Channel name\n\nSend the name to use for all the channels (spaces are fine).\n"
               "Send /stop to cancel.")
 
 
 async def ask_create_count():
+    conv = S().conv
     conv["step"] = "c_count"
     await say(f"✅ Name: {conv['name']}\n\n🔢 Step 2 of 2 — How many?\n\n"
               f"Send the number of channels to create (1 to {MAX_COUNT}).")
 
 
 async def show_create_confirm():
+    conv = S().conv
     conv["step"] = "c_confirm"
     await say(f"✅ Ready.\n\nName: {conv['name']}\nCount: {conv['count']}\n"
               f"Restricted (no forwarding): {'yes' if RESTRICT else 'no'}",
               buttons=[[Button.inline("▶️ Create channels", b"go")], [Button.inline("✖️ Cancel", b"cancel")]])
 
 
+# ----------------------------- login flow -----------------------------
+async def _finish_login(sess):
+    sess.client = sess.login_client
+    sess.login_client = None
+    sess.dialogs_loaded = False
+    session_strings[str(sess.user_id)] = sess.client.session.save()
+    save_sessions()
+    try:
+        me = await sess.client.get_me()
+        sess.name = me.first_name or "there"
+        who = me.first_name or "your account"
+    except Exception:
+        who = "your account"
+    sess.reset_conv()
+    await say(f"✅ Logged in as {who}.\n\nYou can now use /copy and /create. Send /help for the guide.")
+
+
+async def login_phone(text):
+    sess = S()
+    conv = sess.conv
+    phone = re.sub(r"[^\d+]", "", text)
+    if not re.fullmatch(r"\+?\d{7,15}", phone):
+        await say("❌ That doesn't look like a valid phone number.\nSend it in international format, e.g. +919876543210, or /stop.")
+        return
+    try:
+        sess.login_client = TelegramClient(StringSession(), api_id, api_hash)
+        await sess.login_client.connect()
+        sent = await sess.login_client.send_code_request(phone)
+    except PhoneNumberInvalidError:
+        await say("❌ Telegram says that phone number is invalid. Send a valid one, or /stop.")
+        return
+    except FloodWaitError as e:
+        await say(f"⏳ Too many attempts. Telegram asked to wait {fmt_duration(e.seconds)}. Try /login later.")
+        sess.reset_conv()
+        return
+    except Exception as e:
+        await say(f"❌ Couldn't send the code: {e}\n\nCheck the number and send /login to try again.")
+        sess.reset_conv()
+        return
+    conv["phone"] = phone
+    conv["phone_code_hash"] = sent.phone_code_hash
+    conv["step"] = "login_code"
+    await say("📩 I sent a login code to your Telegram app.\n\n"
+              "Type the code here, but put spaces or dashes between the digits so Telegram doesn't block it.\n"
+              "For example: 1 2 3 4 5  or  1-2-3-4-5\n\n"
+              "Send /stop to cancel.")
+
+
+async def login_code(text):
+    sess = S()
+    conv = sess.conv
+    code = re.sub(r"\D", "", text)
+    if not code:
+        await say("Please send the digits of the code (spaces or dashes between them are fine), or /stop.")
+        return
+    try:
+        await sess.login_client.sign_in(phone=conv["phone"], code=code, phone_code_hash=conv["phone_code_hash"])
+    except SessionPasswordNeededError:
+        conv["step"] = "login_password"
+        await say("🔒 Your account uses two-step verification.\nSend your password here to finish logging in, or /stop.")
+        return
+    except PhoneCodeInvalidError:
+        await say("❌ That code is wrong. Type it again (spaces/dashes between digits are fine), or /stop.")
+        return
+    except PhoneCodeExpiredError:
+        await say("❌ The code expired. Send /login to get a new one.")
+        sess.reset_conv()
+        return
+    except Exception as e:
+        await say(f"❌ Login failed: {e}\n\nSend /login to try again.")
+        sess.reset_conv()
+        return
+    await _finish_login(sess)
+
+
+async def login_password(text):
+    sess = S()
+    try:
+        await sess.login_client.sign_in(password=text.strip())
+    except PasswordHashInvalidError:
+        await say("❌ Wrong password. Send it again, or /stop.")
+        return
+    except Exception as e:
+        await say(f"❌ Login failed: {e}\n\nSend /login to try again.")
+        sess.reset_conv()
+        return
+    await _finish_login(sess)
+
+
 # ----------------------------- commands -----------------------------
 async def cmd_start(arg):
-    reset_conv()
-    await say(WELCOME.format(name=my_name))
+    S().reset_conv()
+    await say(WELCOME.format(name=S().name))
 
 
 async def cmd_help(arg):
@@ -827,20 +1031,71 @@ async def cmd_about(arg):
 
 
 async def cmd_ping(arg):
-    await say(f"🏓 Pong! I'm online.\nUptime: {fmt_duration(time.time() - started_at)}")
+    await say(f"🏓 Pong! I'm online.\nUptime: {fmt_duration(time.time() - S().started_at)}")
+
+
+async def cmd_login(arg):
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first if you want to switch accounts.")
+        return
+    if await ensure_client(sess):
+        try:
+            me = await sess.client.get_me()
+            who = me.first_name or "your account"
+        except Exception:
+            who = "your account"
+        await say(f"✅ You're already logged in as {who}.\nSend /logout first if you want to use a different account.")
+        return
+    sess.reset_conv()
+    sess.conv["kind"] = "login"
+    sess.conv["step"] = "login_phone"
+    await say("🔐 Let's connect your Telegram account.\n\n"
+              "Send your phone number in international format, e.g. +919876543210.\n\n"
+              "⚠️ Logging in lets this bot act on your behalf (copy content, create channels). "
+              "Only do this with a bot you trust. Send /stop to cancel.")
+
+
+async def cmd_logout(arg):
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first.")
+        return
+    c = await ensure_client(sess)
+    if not c and str(sess.user_id) not in session_strings:
+        await say("You're not logged in. Send /login to connect an account.")
+        return
+    try:
+        if c:
+            await c.log_out()
+    except Exception:
+        pass
+    try:
+        if sess.client and sess.client.is_connected():
+            await sess.client.disconnect()
+    except Exception:
+        pass
+    sess.client = None
+    sess.dialogs_loaded = False
+    sess.name = "there"
+    session_strings.pop(str(sess.user_id), None)
+    save_sessions()
+    sess.reset_conv()
+    await say("👋 Logged out. Your session has been removed from the bot.\nSend /login to connect again.")
 
 
 async def cmd_status(arg):
-    if job["running"] or job["kind"]:
+    sess = S()
+    if sess.job["running"] or sess.job["kind"]:
         await say(render_job())
-    elif conv["kind"]:
+    elif sess.conv["kind"]:
         await say("📝 A request is in progress. Please continue with the last question, or send /stop to discard it.")
     else:
         await say("✅ No task is running. Send /copy or /create to start one.")
 
 
 async def cmd_errors(arg):
-    errs = job["errors"]
+    errs = S().job["errors"]
     if not errs:
         await say("✅ No errors recorded.")
         return
@@ -852,21 +1107,26 @@ async def cmd_errors(arg):
 
 
 async def cmd_stop(arg):
-    if job["running"]:
-        job["stop"] = True
+    sess = S()
+    if sess.job["running"]:
+        sess.job["stop"] = True
         await say("🛑 Stopping after the current item…")
-    elif conv["kind"]:
-        reset_conv()
+    elif sess.conv["kind"]:
+        sess.reset_conv()
         await say("Cancelled. Send /copy or /create whenever you're ready.")
     else:
         await say("There is nothing to stop right now.")
 
 
 async def cmd_copy(arg):
-    if job["running"]:
+    sess = S()
+    if sess.job["running"]:
         await say("⚠️ A task is already running. Send /status to see it or /stop to stop it.")
         return
-    reset_conv()
+    if not await require_login(sess):
+        return
+    sess.reset_conv()
+    conv = sess.conv
     conv["kind"] = "copy"
     parts = arg.split()
     if len(parts) > 3:
@@ -897,10 +1157,14 @@ async def cmd_copy(arg):
 
 
 async def cmd_create(arg):
-    if job["running"]:
+    sess = S()
+    if sess.job["running"]:
         await say("⚠️ A task is already running. Send /status to see it or /stop to stop it.")
         return
-    reset_conv()
+    if not await require_login(sess):
+        return
+    sess.reset_conv()
+    conv = sess.conv
     conv["kind"] = "create"
     parts = arg.rsplit(None, 1)
     if len(parts) == 2 and parts[1].isdigit():
@@ -916,18 +1180,26 @@ async def cmd_create(arg):
 
 
 COMMANDS = {
-    "/start": cmd_start, "/help": cmd_help, "/copy": cmd_copy, "/create": cmd_create,
-    "/status": cmd_status, "/errors": cmd_errors, "/stop": cmd_stop, "/cancel": cmd_stop,
-    "/ping": cmd_ping, "/about": cmd_about,
+    "/start": cmd_start, "/help": cmd_help, "/login": cmd_login, "/logout": cmd_logout,
+    "/copy": cmd_copy, "/create": cmd_create, "/status": cmd_status, "/errors": cmd_errors,
+    "/stop": cmd_stop, "/cancel": cmd_stop, "/ping": cmd_ping, "/about": cmd_about,
 }
 
 
 # ----------------------------- free text -----------------------------
 async def handle_text(event, text):
+    sess = S()
+    conv = sess.conv
     step = conv["step"]
     fwd = fwd_channel_id(event.message)
 
-    if step == "src":
+    if step == "login_phone":
+        await login_phone(text)
+    elif step == "login_code":
+        await login_code(text)
+    elif step == "login_password":
+        await login_password(text)
+    elif step == "src":
         try:
             ref = fwd or check_ref(text.split()[0] if text.split() else "", "Source")
         except BadInput as e:
@@ -981,11 +1253,13 @@ async def handle_text(event, text):
             await say(f"❌ Please send a number between 1 and {MAX_COUNT}.")
     else:
         if GREETING_RE.match(text):
-            await say(f"Hello, {my_name}! 👋 How can I help you today?\nSend /copy to copy a channel, /create to create channels, or /help.")
+            await say(f"Hello, {sess.name}! 👋 How can I help you today?\n"
+                      "Send /login to connect your account, then /copy or /create. Send /help for all commands.")
         elif THANKS_RE.match(text):
             await say("You're welcome! Let me know if you need anything else.")
         else:
-            await say("I can copy content between channels and create channels.\nSend /copy or /create to begin, or /help for all commands.")
+            await say("I can copy content between channels and create channels on your account.\n"
+                      "Send /login to connect, then /copy or /create, or /help for all commands.")
 
 
 async def handle_message(event):
@@ -1007,27 +1281,30 @@ async def handle_message(event):
 async def on_message(event):
     if not event.is_private:
         return
-    if event.sender_id != my_id:
-        await event.respond(
-            "🔒 This is a private assistant and can only be used by its owner.\n\n"
-            f"Your Telegram ID: {event.sender_id}\n"
-            "If this is your own bot and you still see this message, your SESSION_STRING belongs to a "
-            "different account than the one you are chatting from. Generate a new one with that account.",
-            parse_mode=None)
-        return
+    sess = get_sess(event.sender_id)
+    _cur.set(sess)
+    if sess.name == "there":
+        try:
+            sender = await event.get_sender()
+            sess.name = getattr(sender, "first_name", None) or "there"
+        except Exception:
+            pass
     try:
         await handle_message(event)
     except Exception as e:
         print(f"Handler error: {e}")
-        await say(f"⚠️ Something went wrong: {e}")
+        try:
+            await say(f"⚠️ Something went wrong: {e}")
+        except Exception:
+            pass
 
 
 @bot.on(events.CallbackQuery)
 async def on_button(event):
-    if event.sender_id != my_id:
-        await event.answer("This assistant is private.", alert=True)
-        return
+    sess = get_sess(event.sender_id)
+    _cur.set(sess)
     data = (event.data or b"").decode()
+    conv = sess.conv
     step = conv["step"]
 
     async def expired():
@@ -1036,7 +1313,7 @@ async def on_button(event):
     try:
         if data == "cancel":
             await event.answer()
-            reset_conv()
+            sess.reset_conv()
             await event.edit("Cancelled. Send /copy or /create whenever you're ready.")
         elif data == "src:last" and step == "src":
             last = get_setting("last_src")
@@ -1060,7 +1337,7 @@ async def on_button(event):
                 conv.update(start=0, start_label="the beginning")
             else:
                 key = f"{conv['src_id']}->{conv['dst_id']}"
-                last_id = jload(PROGRESS_FILE).get(key, 0)
+                last_id = progress_map().get(key, 0)
                 conv.update(start=last_id, start_label=f"resuming after message ID {last_id}")
             await event.edit(f"Start: {conv['start_label']}")
             await copy_next()
@@ -1081,7 +1358,7 @@ async def on_button(event):
                                                       "names": "file names only"}[conv["scope"]])
             await copy_next()
         elif data == "go" and step in ("confirm", "c_confirm"):
-            if job["running"]:
+            if sess.job["running"]:
                 await event.answer("Another task is already running.", alert=True)
                 return
             await event.answer()
@@ -1099,15 +1376,6 @@ async def on_button(event):
 
 # ----------------------------- startup -----------------------------
 async def main():
-    global my_id, my_name
-    await client.connect()
-    if not await client.is_user_authorized():
-        print("ERROR: SESSION_STRING is invalid or expired. Generate a new one with generate_session.py.")
-        sys.exit(1)
-    me = await client.get_me()
-    my_id = me.id
-    my_name = me.first_name or "there"
-
     try:
         await bot.start(bot_token=bot_token)
     except Exception as e:
@@ -1119,6 +1387,8 @@ async def main():
             scope=BotCommandScopeDefault(), lang_code="",
             commands=[
                 BotCommand("start", "Welcome message"),
+                BotCommand("login", "Connect your Telegram account"),
+                BotCommand("logout", "Disconnect your account"),
                 BotCommand("copy", "Copy a channel (guided)"),
                 BotCommand("create", "Create multiple channels"),
                 BotCommand("status", "Live progress"),
@@ -1131,15 +1401,10 @@ async def main():
     except Exception as e:
         print(f"Could not set the command menu: {e}")
 
-    print(f"Channel Tools Assistant {VERSION} is running. Account: {my_name} | Bot: @{bme.username}")
-    print(f"Owner account ID: {my_id}")
-    try:
-        await bot.send_message(my_id, "✅ Channel Tools Assistant is online. Send /copy or /create to begin, or /help.",
-                               parse_mode=None)
-    except Exception as e:
-        print(f"Startup message not sent (open the bot and press Start): {e}")
-
-    await asyncio.gather(client.run_until_disconnected(), bot.run_until_disconnected())
+    print(f"Channel Tools Assistant {VERSION} is running. Bot: @{bme.username}")
+    print(f"Logged-in users remembered: {len(session_strings)}")
+    await bot.run_until_disconnected()
 
 
-client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    bot.loop.run_until_complete(main())
