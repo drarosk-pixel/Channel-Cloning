@@ -163,7 +163,7 @@ class UserSession:
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, paused=False, pending_id=0, fast_note="", refresh_refs=False,
-            base_done=0,
+            base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0,
         )
 
 
@@ -719,13 +719,34 @@ def render_job():
 async def refresh(status, force=False):
     job = S().job
     now = time.time()
+    if now < job.get("edit_block_until", 0.0):
+        return                      # Telegram told us to stop editing for a while
     if not force and now - job["last_edit"] < EDIT_EVERY:
         return
     job["last_edit"] = now
+    target = job.get("status_msg") or status
     try:
-        await status.edit(render_job(), parse_mode=None)
-    except Exception:
-        pass
+        await target.edit(render_job(), parse_mode=None)
+        job["status_msg"] = target
+        job["edit_fails"] = 0
+    except FloodWaitError as e:
+        # editing one message for hours gets the whole chat rate-limited, which used to freeze
+        # the status silently (and block replies). Back off for as long as Telegram asks.
+        job["edit_block_until"] = time.time() + e.seconds + 1
+        print(f"Status edits paused for {e.seconds}s (Telegram rate limit); the copy continues.",
+              flush=True)
+    except Exception as e:
+        n = job.get("edit_fails", 0) + 1
+        job["edit_fails"] = n
+        if n == 1:
+            print(f"Status update failed: {type(e).__name__}: {e}", flush=True)
+        if n >= 3:
+            # the old message can no longer be edited: post a fresh one instead of going silent
+            try:
+                job["status_msg"] = await say(render_job())
+                job["edit_fails"] = 0
+            except Exception:
+                pass
 
 
 # ----------------------------- copy engine -----------------------------
