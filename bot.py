@@ -182,7 +182,8 @@ class UserSession:
             force_dl=False,
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
-            pending=None, paused=False, pending_id=0, fast_note="", refresh_refs=False,
+            pending=None, pending_kind="", paused=False, pending_id=0,
+            fast_note="", refresh_refs=False,
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0,
             send_block_until=0.0,
             topic_name="", topic_idx=0, topic_total=0,
@@ -716,8 +717,15 @@ def render_job():
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
         if job.get("fast_note"):
             lines.append(f"⚠️ {job['fast_note']}")
-        if job.get("paused") and job.get("pending_id"):
-            lines.append(f"⏸ Paused — tap a button to retry/skip message ID {job['pending_id']} (nothing skipped yet)")
+        if job.get("paused"):
+            kind = job.get("pending_kind")
+            if kind == "topic":
+                lines.append(f"⏸ Waiting for your choice on topic: {job.get('topic_name', '')}")
+            elif kind == "start_id":
+                lines.append("⏸ Waiting for a starting message ID (or use the buttons)")
+            elif job.get("pending_id"):
+                lines.append(f"⏸ Paused — retry or skip message ID {job['pending_id']}"
+                             " (nothing skipped yet)")
         if job["force_dl"]:
             # download/upload mode: the per-file speed above is the real one; show total moved
             if job["bytes_done"]:
@@ -1280,11 +1288,41 @@ async def list_topics(client, ent):
     return [(t.id, t.title) for t in found]
 
 
+async def ask_topic_start(name, seg_key):
+    """Ask where to start inside a topic. Returns an int message id, or begin / resume / stop.
+    If this topic was interrupted before, its own stopping point is offered."""
+    job = S().job
+    last_id, already = progress_entry(seg_key)
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["pending_kind"] = "start_id"
+    job["paused"] = True
+    rows = [[Button.inline("⏮ Start from the beginning", b"st:begin")]]
+    if last_id:
+        rows.append([Button.inline(f"⏯ Resume after message ID {last_id}", b"st:resume")])
+    rows.append([Button.inline("🛑 Stop the copy", b"st:stop")])
+    seen = (f"\n\nLast time this topic stopped after message ID {last_id}"
+            f" ({already} copied)." if last_id else "")
+    try:
+        await say(f"📍 Starting point for topic: {name}\n\n"
+                  "Send a message ID to start from, or use a button below." + seen,
+                  critical=True, buttons=rows)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["pending_kind"] = ""
+        job["paused"] = False
+
+
 async def ask_topic(name, idx, total):
     """Pause before a topic and ask whether to copy it. Returns copy / skip / stop."""
     job = S().job
     fut = asyncio.get_event_loop().create_future()
     job["pending"] = fut
+    job["pending_kind"] = "topic"
     job["paused"] = True
     try:
         await say(f"📂 Topic {idx} of {total}: {name}\n\n"
@@ -1299,6 +1337,7 @@ async def ask_topic(name, idx, total):
             return "stop"
     finally:
         job["pending"] = None
+        job["pending_kind"] = ""
         job["paused"] = False
 
 
@@ -1352,6 +1391,7 @@ async def ask_retry(last_id, err):
     job = sess.job
     fut = asyncio.get_event_loop().create_future()
     job["pending"] = fut
+    job["pending_kind"] = "retry"
     job["pending_id"] = last_id
     job["paused"] = True
     name = type(err).__name__ if err else "error"
@@ -1520,15 +1560,27 @@ async def copy_topics(client, src, dst, opts, topics, status):
     job = S().job
     total_t = len(topics)
     job["topic_total"] = total_t
-    resume = bool(opts.get("resume"))
+    pair = f"{src.id}->{dst.id}"
+
+    # resuming picks up at the topic that was interrupted, so you don't skip past the earlier ones
+    start_at = 0
+    if opts.get("resume"):
+        last_tid = get_setting(f"last_topic:{pair}")
+        for k, (tid, _name) in enumerate(topics):
+            if tid == last_tid:
+                start_at = k
+                break
+    note = f"\nContinuing from topic {start_at + 1}: {topics[start_at][1]}" if start_at else ""
     await say(f"📂 {job['src']} is a topic group with {total_t} topic(s).\n"
               "I'll go through them one at a time from the bottom of the list, "
-              "and ask before each one.")
-    for i, (tid, name) in enumerate(topics, start=1):
+              f"and ask before each one.{note}")
+
+    for k in range(start_at, total_t):
+        tid, name = topics[k]
         if job["stop"]:
             break
-        job.update(topic_idx=i, topic_name=name)
-        choice = await ask_topic(name, i, total_t)
+        job.update(topic_idx=k + 1, topic_name=name)
+        choice = await ask_topic(name, k + 1, total_t)
         if choice == "stop":
             job["stop"] = True
             break
@@ -1536,9 +1588,20 @@ async def copy_topics(client, src, dst, opts, topics, status):
             await say(f"⏭ Skipped topic: {name}")
             continue
 
-        seg_key = f"{src.id}->{dst.id}#{tid}"
+        seg_key = f"{pair}#{tid}"
+        where = await ask_topic_start(name, seg_key)
+        if where == "stop":
+            job["stop"] = True
+            break
         last_id, already = progress_entry(seg_key)
-        start_id = last_id if resume else 0
+        if isinstance(where, int):
+            start_id, base = max(0, where - 1), 0   # start from the id you sent
+        elif where == "resume":
+            start_id, base = last_id, already
+        else:
+            start_id, base = 0, 0
+        # remember where we are, so a later resume comes back to this topic
+        set_setting(f"last_topic:{pair}", tid)
         try:
             total_m = getattr(await client.get_messages(src, limit=0, reply_to=tid), "total", 0) or 0
         except Exception:
@@ -1551,7 +1614,7 @@ async def copy_topics(client, src, dst, opts, topics, status):
         except Exception:
             pass
         # this topic's own counters, so /status reads like "2 / 3" inside the topic
-        job.update(key=seg_key, base_done=(already if resume else 0), done=0, skipped=0,
+        job.update(key=seg_key, base_done=base, done=0, skipped=0,
                    failed=0, total_msgs=total_m, cur_id=start_id, min_id=start_id, top_id=top)
 
         if not start_id:
@@ -1563,6 +1626,9 @@ async def copy_topics(client, src, dst, opts, topics, status):
 
         await copy_messages(client, src, dst, opts, tid, start_id, status)
         if not job["stop"]:
+            if k + 1 < total_t:
+                # finished cleanly, so a later resume should offer the next topic
+                set_setting(f"last_topic:{pair}", topics[k + 1][0])
             await say(f"✅ Topic done: {name} — copied {job['done']}, "
                       f"skipped {job['skipped']}, failed {job['failed']}.")
 
@@ -2425,6 +2491,14 @@ COMMANDS = {
 async def handle_text(event, text):
     sess = S()
     conv = sess.conv
+    # a running copy can be waiting for a starting message id for the current topic
+    fut = sess.job.get("pending")
+    if fut is not None and not fut.done() and sess.job.get("pending_kind") == "start_id":
+        if text.strip().isdigit():
+            fut.set_result(int(text.strip()))
+        else:
+            await say("Please send a message ID (just the number), or use the buttons above.")
+        return
     step = conv["step"]
     fwd = fwd_channel_id(event.message)
 
@@ -2565,9 +2639,23 @@ async def on_button(event):
         await event.answer("This request has expired. Please start again.", alert=True)
 
     try:
-        if data in ("tp:copy", "tp:skip", "tp:stop"):
+        if data in ("st:begin", "st:resume", "st:stop"):
             fut = sess.job.get("pending")
-            if fut is None or fut.done():
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "start_id":
+                return await expired()
+            await event.answer()
+            try:
+                await event.edit({"st:begin": "⏮ Starting from the beginning…",
+                                  "st:resume": "⏯ Resuming where it stopped…",
+                                  "st:stop": "🛑 Stopping the copy."}[data])
+            except Exception:
+                pass
+            if data == "st:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data in ("tp:copy", "tp:skip", "tp:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "topic":
                 return await expired()
             await event.answer()
             try:
@@ -2581,7 +2669,7 @@ async def on_button(event):
             fut.set_result(data.split(":", 1)[1])
         elif data in ("job:retry", "job:skip", "job:stop"):
             fut = sess.job.get("pending")
-            if fut is None or fut.done():
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "retry":
                 return await expired()
             await event.answer()
             label = {"job:retry": "🔁 Retrying this file…",
