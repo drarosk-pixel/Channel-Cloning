@@ -982,10 +982,15 @@ def reset_dir(prefix):
 
 
 async def wait_flood(e):
+    """Wait out a transfer flood, then carry on from the same place."""
     job = S().job
     job["flood_until"] = time.time() + e.seconds + 1
+    # also log it, in case Telegram is blocking our messages and /status can't be updated
+    print(f"Flood wait {e.seconds}s ({fmt_duration(e.seconds)}); auto-resuming after that "
+          f"at message ID {job.get('cur_id', 0)}.", flush=True)
     await asyncio.sleep(e.seconds + 1)
     job["flood_until"] = 0.0
+    print("Flood wait over, continuing.", flush=True)
 
 
 def make_captioner(opts):
