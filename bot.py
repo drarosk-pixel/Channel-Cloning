@@ -163,6 +163,7 @@ class UserSession:
             kind=None, step=None,
             src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
             start=None, start_label="", base_done=0, resume=False,
+            topics=None, topic_id=None, topic_name="", topic_page=0,
             rules=[], scope="both", link_rules=[],
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
@@ -1554,7 +1555,7 @@ async def copy_messages(client, src, dst, opts, topic_id, start_id, status):
             await flush()
 
 
-async def copy_topics(client, src, dst, opts, topics, status):
+async def copy_topics(client, src, dst, opts, topics, status, min_id):
     """Walks a forum group's topics one at a time, asking before each one. Each topic keeps
     its own progress, so the counter shows that topic's messages, not the whole group's."""
     job = S().job
@@ -1562,44 +1563,46 @@ async def copy_topics(client, src, dst, opts, topics, status):
     job["topic_total"] = total_t
     pair = f"{src.id}->{dst.id}"
 
-    # resuming picks up at the topic that was interrupted, so you don't skip past the earlier ones
+    # the first topic and its starting point were chosen during the /copy steps
+    first_tid = opts.get("topic_id")
     start_at = 0
-    if opts.get("resume"):
-        last_tid = get_setting(f"last_topic:{pair}")
-        for k, (tid, _name) in enumerate(topics):
-            if tid == last_tid:
-                start_at = k
-                break
-    note = f"\nContinuing from topic {start_at + 1}: {topics[start_at][1]}" if start_at else ""
+    for k, (tid, _name) in enumerate(topics):
+        if tid == (first_tid if first_tid else get_setting(f"last_topic:{pair}")):
+            start_at = k
+            break
     await say(f"📂 {job['src']} is a topic group with {total_t} topic(s).\n"
-              "I'll go through them one at a time from the bottom of the list, "
-              f"and ask before each one.{note}")
+              f"Starting at topic {start_at + 1}: {topics[start_at][1]}. "
+              "I'll ask about the next ones as we go.")
 
     for k in range(start_at, total_t):
         tid, name = topics[k]
         if job["stop"]:
             break
         job.update(topic_idx=k + 1, topic_name=name)
-        choice = await ask_topic(name, k + 1, total_t)
-        if choice == "stop":
-            job["stop"] = True
-            break
-        if choice == "skip":
-            await say(f"⏭ Skipped topic: {name}")
-            continue
+
+        if k == start_at and first_tid == tid:
+            start_id, base = min_id, opts.get("base_done") or 0
+        else:
+            choice = await ask_topic(name, k + 1, total_t)
+            if choice == "stop":
+                job["stop"] = True
+                break
+            if choice == "skip":
+                await say(f"⏭ Skipped topic: {name}")
+                continue
+            where = await ask_topic_start(name, f"{pair}#{tid}")
+            if where == "stop":
+                job["stop"] = True
+                break
+            last_id, already = progress_entry(f"{pair}#{tid}")
+            if isinstance(where, int):
+                start_id, base = max(0, where - 1), 0   # start from the id you sent
+            elif where == "resume":
+                start_id, base = last_id, already
+            else:
+                start_id, base = 0, 0
 
         seg_key = f"{pair}#{tid}"
-        where = await ask_topic_start(name, seg_key)
-        if where == "stop":
-            job["stop"] = True
-            break
-        last_id, already = progress_entry(seg_key)
-        if isinstance(where, int):
-            start_id, base = max(0, where - 1), 0   # start from the id you sent
-        elif where == "resume":
-            start_id, base = last_id, already
-        else:
-            start_id, base = 0, 0
         # remember where we are, so a later resume comes back to this topic
         set_setting(f"last_topic:{pair}", tid)
         try:
@@ -1679,7 +1682,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
             record_error("reading topics", e)      # fall back to copying it as a plain channel
 
         if topics:
-            await copy_topics(client, src, dst, opts, topics, status)
+            await copy_topics(client, src, dst, opts, topics, status, min_id)
         else:
             try:
                 job["total_msgs"] = getattr(await client.get_messages(src, limit=0), "total", 0) or 0
@@ -1774,7 +1777,8 @@ def build_opts(conv):
     return {"rules": rules, "scope": conv["scope"] or "both", "link_rules": link_rules,
             "thumb": conv["thumb"], "footer": footer,
             "base_done": conv.get("base_done") or 0,
-            "resume": bool(conv.get("resume"))}
+            "resume": bool(conv.get("resume")),
+            "topic_id": conv.get("topic_id")}
 
 
 async def _run_in_session(sess, coro):
@@ -1947,18 +1951,77 @@ async def handle_channel_text(kind, text, fwd):
                   "Try fewer letters, or send the @username / ID, or forward a message from the channel.")
 
 
+def progress_key_for(conv):
+    """Progress is kept per topic for forum groups, and per channel otherwise."""
+    pair = f"{conv['src_id']}->{conv['dst_id']}"
+    return f"{pair}#{conv['topic_id']}" if conv.get("topic_id") else pair
+
+
+TOPIC_PAGE = 8
+
+
+def topic_rows(conv, page):
+    items = conv.get("topics") or []
+    start = page * TOPIC_PAGE
+    rows = [[Button.inline(f"📂 {name[:40]}", f"tpk:{start + i}".encode())]
+            for i, (_tid, name) in enumerate(items[start:start + TOPIC_PAGE])]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ Prev", f"tpg:{page - 1}".encode()))
+    if start + TOPIC_PAGE < len(items):
+        nav.append(Button.inline("Next ▶️", f"tpg:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    return rows
+
+
+def build_topic_pick(conv):
+    """Text and buttons for the topic step: every topic, with the interrupted one on top."""
+    items = conv.get("topics") or []
+    pair = f"{conv['src_id']}->{conv['dst_id']}"
+    last_tid = get_setting(f"last_topic:{pair}")
+    page = conv.get("topic_page") or 0
+    pages = max(1, (len(items) + TOPIC_PAGE - 1) // TOPIC_PAGE)
+
+    head = (f"✅ Destination: {conv['dst_title']}\n\n"
+            f"📂 Step 3 of 5 — Topic\n\nThis is a topic group with {len(items)} topic(s), "
+            "listed from the bottom.\nPick the one to start with — I'll ask about the rest "
+            f"as we go.\n\nPage {page + 1} of {pages}")
+    rows = []
+    for i, (tid, name) in enumerate(items):
+        if tid == last_tid:
+            lid, _cnt = progress_entry(f"{pair}#{tid}")
+            seen = f" — stopped after ID {lid}" if lid else ""
+            head += f"\n\nLast time you were on: {name}{seen}"
+            rows.append([Button.inline(f"⏯ Continue: {name[:30]}", f"tpk:{i}".encode())])
+            break
+    rows += topic_rows(conv, page)
+    rows.append([Button.inline("✖️ Cancel", b"cancel")])
+    return head, rows
+
+
+async def ask_topic_pick():
+    conv = S().conv
+    conv["step"] = "topic"
+    text, rows = build_topic_pick(conv)
+    await say(text, buttons=rows)
+
+
 async def ask_start():
     conv = S().conv
     conv["step"] = "start"
-    key = f"{conv['src_id']}->{conv['dst_id']}"
-    last_id, done_n = progress_entry(key)
+    last_id, done_n = progress_entry(progress_key_for(conv))
     rows = [[Button.inline("⏮ From the beginning", b"start:begin")]]
     if last_id:
-        label = f"⏯ Resume ({done_n} already copied)" if done_n else f"⏯ Resume (after message ID {last_id})"
+        label = (f"⏯ Resume after message ID {last_id}" if not done_n
+                 else f"⏯ Resume after message ID {last_id} ({done_n} copied)")
         rows.append([Button.inline(label, b"start:resume")])
-    await say(f"✅ Destination: {conv['dst_title']}\n\n"
-              "📍 Step 3 of 4 — Starting point\n\n"
-              "Choose where to start, or send a message ID to start from that message.", buttons=rows)
+    if conv.get("topic_id"):
+        head = f"✅ Topic: {conv['topic_name']}\n\n📍 Step 4 of 5 — Starting point"
+    else:
+        head = f"✅ Destination: {conv['dst_title']}\n\n📍 Step 3 of 4 — Starting point"
+    await say(f"{head}\n\n"
+              "Send a message ID to start from, or choose below.", buttons=rows)
 
 
 async def show_extras():
@@ -2070,8 +2133,10 @@ async def show_copy_confirm():
     scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}.get(conv["scope"] or "both")
     lines = ["✅ Everything is ready.\n",
              f"Source: {conv['src_title']}",
-             f"Destination: {conv['dst_title']}",
-             f"Start: {conv['start_label']}"]
+             f"Destination: {conv['dst_title']}"]
+    if conv.get("topic_id"):
+        lines.append(f"Topic: {conv['topic_name']} (I'll ask about the next topics as we go)")
+    lines.append(f"Start: {conv['start_label']}")
     if rules:
         lines.append(f"Word rules: {len(rules)} ({scope})")
         for o, n in rules[:6]:
@@ -2101,6 +2166,8 @@ async def copy_next():
         await ask_src()
     elif conv["dst"] is None:
         await ask_dst()
+    elif conv.get("topics") and conv.get("topic_id") is None:
+        await ask_topic_pick()          # only for topic groups; channels skip this
     elif conv["start"] is None:
         await ask_start()
     else:
@@ -2116,6 +2183,11 @@ async def set_src(ref):
         await say(f"❌ {e}\n\nPlease send the source again, or /stop.")
         return False
     conv.update(src=ref, src_id=ent.id, src_title=title_of(ent))
+    # a topic group gets an extra step later; None means plain channel
+    try:
+        conv["topics"] = await list_topics(S().client, ent)
+    except Exception:
+        conv["topics"] = None
     return True
 
 
@@ -2564,6 +2636,8 @@ async def handle_text(event, text):
         set_setting("link_rules", pairs)
         await say(f"✅ {len(pairs)} link rule(s) saved.")
         await show_extras()
+    elif step == "topic":
+        await say("Please pick a topic using the buttons above, or send /stop to cancel.")
     elif step in ("scope", "extras", "confirm", "c_confirm"):
         await say("Please choose an option using the buttons above, or send /stop to cancel.")
     elif step == "c_name":
@@ -2714,6 +2788,24 @@ async def on_button(event):
                 await event.edit(text, buttons=rows)
             except Exception:
                 pass
+        elif data.startswith("tpg:") and step == "topic":
+            await event.answer()
+            conv["topic_page"] = int(data.split(":", 1)[1])
+            text, rows = build_topic_pick(conv)
+            try:
+                await event.edit(text, buttons=rows)
+            except Exception:
+                pass
+        elif data.startswith("tpk:") and step == "topic":
+            idx = int(data.split(":", 1)[1])
+            items = conv.get("topics") or []
+            if idx >= len(items):
+                return await expired()
+            tid, name = items[idx]
+            await event.answer()
+            await event.edit(f"Topic selected: {name}")
+            conv.update(topic_id=tid, topic_name=name)
+            await copy_next()
         elif data.startswith("pk:"):
             try:
                 _, kind, idx = data.split(":")
@@ -2738,8 +2830,7 @@ async def on_button(event):
                 conv.update(start=0, start_label="the beginning", base_done=0, resume=False)
             else:
                 conv["resume"] = True
-                key = f"{conv['src_id']}->{conv['dst_id']}"
-                last_id, done_n = progress_entry(key)
+                last_id, done_n = progress_entry(progress_key_for(conv))
                 conv.update(start=last_id, base_done=done_n,
                             start_label=f"resuming after message ID {last_id}"
                                         + (f" ({done_n} already copied)" if done_n else ""))
