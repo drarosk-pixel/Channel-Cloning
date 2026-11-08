@@ -2,6 +2,7 @@ import io
 import os
 import re
 import sys
+import inspect
 import json
 import time
 import copy
@@ -38,7 +39,26 @@ except Exception as _e:
     fast_download = None
     FAST_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
-VERSION = "v10"
+VERSION = "v11"
+
+# Telegram moved the "list forum topics" call between API namespaces, and renamed its first
+# argument from `channel` to `peer`, so find whichever this Telethon version ships instead of
+# guessing. Topic support simply switches off if it isn't available.
+GetForumTopicsRequest = None
+for _ns in ("channels", "messages"):
+    try:
+        GetForumTopicsRequest = getattr(
+            __import__(f"telethon.tl.functions.{_ns}", fromlist=["GetForumTopicsRequest"]),
+            "GetForumTopicsRequest")
+        break
+    except Exception:
+        continue
+
+
+def forum_topics_request(ent, **kw):
+    params = inspect.signature(GetForumTopicsRequest.__init__).parameters
+    first = "channel" if "channel" in params else "peer"
+    return GetForumTopicsRequest(**{first: ent}, **kw)
 
 
 def need(name):
@@ -142,7 +162,7 @@ class UserSession:
         self.conv.update(
             kind=None, step=None,
             src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
-            start=None, start_label="", base_done=0,
+            start=None, start_label="", base_done=0, resume=False,
             rules=[], scope="both", link_rules=[],
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
@@ -164,6 +184,8 @@ class UserSession:
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, paused=False, pending_id=0, fast_note="", refresh_refs=False,
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0,
+            send_block_until=0.0,
+            topic_name="", topic_idx=0, topic_total=0,
         )
 
 
@@ -276,8 +298,29 @@ def bar(pct, width=12):
     return "█" * filled + "░" * (width - filled)
 
 
-async def say(text, **kw):
-    return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+async def say(text, critical=False, **kw):
+    """Send a message to the user. Telegram sometimes rate-limits sending for a long time;
+    that must never kill a running copy, so note the wait for /status and either skip this
+    message (a notice) or wait it out and retry (a prompt the copy depends on)."""
+    try:
+        return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+    except FloodWaitError as e:
+        job = S().job
+        job["send_block_until"] = time.time() + e.seconds + 1
+        print(f"Telegram wants {e.seconds}s before the bot can send again"
+              f"{'; waiting and retrying' if critical else '; skipping this notice'}"
+              " — the copy keeps running.", flush=True)
+        if not critical:
+            return None
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+        except Exception as e2:
+            print(f"Could not send after the wait: {type(e2).__name__}: {e2}", flush=True)
+            return None
+    except Exception as e:
+        print(f"Could not send message: {type(e).__name__}: {e}", flush=True)
+        return None
 
 
 # ----------------------------- user client lifecycle -----------------------------
@@ -375,6 +418,10 @@ HELP = (
     "• Speed: use /speed to lower the delay (e.g. 0.8s). If Telegram pauses you "
     "(flood wait), /status shows a live countdown and the copy resumes automatically "
     "from the same message when the wait ends.\n"
+    "• Topic groups: if the source is a topic (forum) group, I go through the topics one at a "
+    "time starting from the bottom of the list, and ask before each one. Choosing Copy sends "
+    "the topic title to the destination first, then its content. Each topic keeps its own "
+    "count and its own resume point. Plain channels are unaffected.\n"
     "• Protected/private sources: the bot detects these and goes straight to "
     "download-and-upload mode (no wasted attempt). /status shows live download/upload "
     "percentage and speed for the current file."
@@ -643,7 +690,10 @@ def render_job():
         else:
             span = max(job["top_id"] - job["min_id"], 1)
             pct = 100.0 if phase == "done" else min(100.0, max(0.0, (job["cur_id"] - job["min_id"]) / span * 100))
-        lines.append(f"{job['src']} → {job['dst']}\n")
+        lines.append(f"{job['src']} → {job['dst']}")
+        if job.get("topic_total"):
+            lines.append(f"📂 Topic {job['topic_idx']}/{job['topic_total']}: {job['topic_name']}")
+        lines.append("")
         lines.append(f"{bar(pct)} {pct:.0f}%")
         if total_c:
             lines.append(f"Content: {processed} / {total_c}")
@@ -699,11 +749,13 @@ def render_job():
         lines.append(f"Created: {job['done']} / {job['total']}")
         lines.append(f"Elapsed: {fmt_duration(elapsed)}")
 
-    if phase == "running" and job["flood_until"] > time.time():
-        remaining = int(job["flood_until"] - time.time()) + 1
-        lines.append(f"⏳ Paused by Telegram (flood wait): resuming in {remaining}s…")
+    waits = [w for w in (job.get("flood_until") or 0, job.get("send_block_until") or 0)
+             if w > time.time()]
+    if phase == "running" and waits:
+        left = int(max(waits) - time.time()) + 1
+        lines.append(f"⏳ Flood wait: {left}s ({fmt_duration(left)}) — auto-resuming in {left}s")
         if kind == "copy":
-            lines.append(f"   Will continue right after message ID {job['cur_id']}.")
+            lines.append(f"   Nothing is lost; it continues right after message ID {job['cur_id']}.")
 
     if job["errors"]:
         lines.append(f"\n⚠️ Errors: {len(job['errors'])}")
@@ -725,6 +777,8 @@ async def refresh(status, force=False):
         return
     job["last_edit"] = now
     target = job.get("status_msg") or status
+    if target is None:
+        return
     try:
         await target.edit(render_job(), parse_mode=None)
         job["status_msg"] = target
@@ -1192,6 +1246,62 @@ async def send_group(dst, group, prepared, opts):
         reset_dir("ul")
 
 
+async def list_topics(client, ent):
+    """Topics of a forum group, bottom of the list first (the order you see them from the
+    bottom in Telegram). Returns None when the source is a plain channel, so those copy
+    exactly as before."""
+    if not getattr(ent, "forum", False) or GetForumTopicsRequest is None:
+        return None
+    found, seen = [], set()
+    offset_date, offset_id, offset_topic = 0, 0, 0
+    while True:
+        res = await client(forum_topics_request(
+            ent, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=100))
+        raw = getattr(res, "topics", None) or []
+        if not raw:
+            break
+        for t in raw:
+            # deleted topics carry no title; skip them but still count them for paging
+            if getattr(t, "title", None) and t.id not in seen:
+                seen.add(t.id)
+                found.append(t)
+        if len(raw) < 100:
+            break
+        last = raw[-1]
+        if last.id == offset_topic:       # no progress, stop instead of looping forever
+            break
+        offset_topic = last.id
+        offset_id = getattr(last, "top_message", 0) or 0
+        dates = {m.id: m.date for m in (getattr(res, "messages", None) or [])
+                 if getattr(m, "id", None)}
+        offset_date = dates.get(offset_id) or offset_date
+    found.reverse()        # Telegram lists most recent activity first; we want bottom upwards
+    return [(t.id, t.title) for t in found]
+
+
+async def ask_topic(name, idx, total):
+    """Pause before a topic and ask whether to copy it. Returns copy / skip / stop."""
+    job = S().job
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["paused"] = True
+    try:
+        await say(f"📂 Topic {idx} of {total}: {name}\n\n"
+                  "Copy this topic? Its title goes to the destination first, then its content.",
+                  critical=True,
+                  buttons=[[Button.inline("✅ Copy this topic", b"tp:copy")],
+                           [Button.inline("⏭ Skip this topic", b"tp:skip")],
+                           [Button.inline("🛑 Stop the copy", b"tp:stop")]])
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["paused"] = False
+
+
 def done_count(job):
     """Items finished including ones copied before a resume, so the count and the
     percentage keep going up across resumes instead of restarting at zero."""
@@ -1296,6 +1406,167 @@ async def process_with_retry(dst, group, opts, prepared=None):
         # decision == "retry": loop and try again
 
 
+async def copy_messages(client, src, dst, opts, topic_id, start_id, status):
+    """Copies a whole channel, or one topic of a forum group when topic_id is given.
+    reply_to limits iteration to that topic; everything else works exactly as before."""
+    job = S().job
+    it_kw = {"reply_to": topic_id} if topic_id else {}
+
+    if PIPELINE:
+        # overlap: a producer downloads the next group while the consumer uploads the current one
+        queue = asyncio.Queue(maxsize=1)
+        STOP = object()
+
+        async def producer():
+            group = []
+            enq = [0]
+
+            async def enqueue(g):
+                job["dl_no"] = job.get("base_done", 0) + enq[0] + 1
+                enq[0] += len(g)
+                try:
+                    prepared = await prepare_group(g, opts)
+                except Exception as e:
+                    prepared = {"__error__": e, "tmp": None}
+                await queue.put((g, prepared))
+
+            try:
+                async for m in client.iter_messages(src, reverse=True, min_id=start_id, **it_kw):
+                    if job["stop"]:
+                        break
+                    if m.action:
+                        continue
+                    if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                        group.append(m)
+                        continue
+                    if group:
+                        await enqueue(group)
+                    group = [m]
+                if group and not job["stop"]:
+                    await enqueue(group)
+            finally:
+                await queue.put(STOP)
+
+        prod = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is STOP:
+                    break
+                group, prepared = item
+                last_id = group[-1].id
+                job["ul_no"] = done_count(job) + 1
+                arg = None if (isinstance(prepared, dict) and "__error__" in prepared) else prepared
+                await process_with_retry(dst, group, opts, prepared=arg)
+                job["cur_id"] = last_id
+                save_progress(job["key"], last_id, done_count(job))
+                if job["stop"]:
+                    break
+                try:
+                    await asyncio.sleep(job["delay"])
+                    await refresh(status)
+                except Exception:
+                    pass
+        finally:
+            prod.cancel()
+            try:
+                await prod
+            except BaseException:
+                pass
+            while not queue.empty():
+                try:
+                    it = queue.get_nowait()
+                except Exception:
+                    break
+                if isinstance(it, tuple):
+                    clean_tmp(it[1])
+    else:
+        # sequential: download a group fully, then upload it (one transfer at a time)
+        group = []
+
+        async def flush():
+            nonlocal group
+            if not group:
+                return
+            g, group = group, []
+            last_id = g[-1].id
+            job["dl_no"] = job["ul_no"] = done_count(job) + 1
+            await process_with_retry(dst, g, opts)
+            job["cur_id"] = last_id
+            save_progress(job["key"], last_id, done_count(job))
+            try:
+                await asyncio.sleep(job["delay"])
+                await refresh(status)
+            except Exception:
+                pass
+
+        async for m in client.iter_messages(src, reverse=True, min_id=start_id, **it_kw):
+            if job["stop"]:
+                break
+            if m.action:
+                continue
+            if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                group.append(m)
+                continue
+            await flush()
+            group = [m]
+        if group and not job["stop"]:
+            await flush()
+
+
+async def copy_topics(client, src, dst, opts, topics, status):
+    """Walks a forum group's topics one at a time, asking before each one. Each topic keeps
+    its own progress, so the counter shows that topic's messages, not the whole group's."""
+    job = S().job
+    total_t = len(topics)
+    job["topic_total"] = total_t
+    resume = bool(opts.get("resume"))
+    await say(f"📂 {job['src']} is a topic group with {total_t} topic(s).\n"
+              "I'll go through them one at a time from the bottom of the list, "
+              "and ask before each one.")
+    for i, (tid, name) in enumerate(topics, start=1):
+        if job["stop"]:
+            break
+        job.update(topic_idx=i, topic_name=name)
+        choice = await ask_topic(name, i, total_t)
+        if choice == "stop":
+            job["stop"] = True
+            break
+        if choice == "skip":
+            await say(f"⏭ Skipped topic: {name}")
+            continue
+
+        seg_key = f"{src.id}->{dst.id}#{tid}"
+        last_id, already = progress_entry(seg_key)
+        start_id = last_id if resume else 0
+        try:
+            total_m = getattr(await client.get_messages(src, limit=0, reply_to=tid), "total", 0) or 0
+        except Exception:
+            total_m = 0
+        top = start_id
+        try:
+            latest = await client.get_messages(src, limit=1, reply_to=tid)
+            if latest:
+                top = max(latest[0].id, start_id)
+        except Exception:
+            pass
+        # this topic's own counters, so /status reads like "2 / 3" inside the topic
+        job.update(key=seg_key, base_done=(already if resume else 0), done=0, skipped=0,
+                   failed=0, total_msgs=total_m, cur_id=start_id, min_id=start_id, top_id=top)
+
+        if not start_id:
+            # the title goes to the destination before the topic's content
+            try:
+                await client.send_message(dst, name, parse_mode=None, link_preview=False)
+            except Exception as e:
+                record_error(f"topic title '{name}'", e)
+
+        await copy_messages(client, src, dst, opts, tid, start_id, status)
+        if not job["stop"]:
+            await say(f"✅ Topic done: {name} — copied {job['done']}, "
+                      f"skipped {job['skipped']}, failed {job['failed']}.")
+
+
 async def run_copy(src_ref, dst_ref, min_id, opts):
     sess = S()
     client = sess.client
@@ -1331,116 +1602,26 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         # protected/private source: skip the pointless direct-copy attempt, download+upload directly
         if getattr(src, "noforwards", False):
             job["force_dl"] = True
-        try:
-            job["total_msgs"] = getattr(await client.get_messages(src, limit=0), "total", 0) or 0
-        except Exception:
-            job["total_msgs"] = 0
-        latest = await client.get_messages(src, limit=1)
-        job["top_id"] = max(latest[0].id if latest else min_id, min_id)
         status = await say("▶️ Copy started…")
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
 
-        if PIPELINE:
-            # overlap: a producer downloads the next group while the consumer uploads the current one
-            queue = asyncio.Queue(maxsize=1)
-            STOP = object()
+        topics = None
+        try:
+            topics = await list_topics(client, src)
+        except Exception as e:
+            record_error("reading topics", e)      # fall back to copying it as a plain channel
 
-            async def producer():
-                group = []
-                enq = [0]
-
-                async def enqueue(g):
-                    job["dl_no"] = job.get("base_done", 0) + enq[0] + 1
-                    enq[0] += len(g)
-                    try:
-                        prepared = await prepare_group(g, opts)
-                    except Exception as e:
-                        prepared = {"__error__": e, "tmp": None}
-                    await queue.put((g, prepared))
-
-                try:
-                    async for m in client.iter_messages(src, reverse=True, min_id=min_id):
-                        if job["stop"]:
-                            break
-                        if m.action:
-                            continue
-                        if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
-                            group.append(m)
-                            continue
-                        if group:
-                            await enqueue(group)
-                        group = [m]
-                    if group and not job["stop"]:
-                        await enqueue(group)
-                finally:
-                    await queue.put(STOP)
-
-            prod = asyncio.create_task(producer())
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is STOP:
-                        break
-                    group, prepared = item
-                    last_id = group[-1].id
-                    job["ul_no"] = done_count(job) + 1
-                    arg = None if (isinstance(prepared, dict) and "__error__" in prepared) else prepared
-                    await process_with_retry(dst, group, opts, prepared=arg)
-                    job["cur_id"] = last_id
-                    save_progress(job["key"], last_id, done_count(job))
-                    if job["stop"]:
-                        break
-                    try:
-                        await asyncio.sleep(job["delay"])
-                        await refresh(status)
-                    except Exception:
-                        pass
-            finally:
-                prod.cancel()
-                try:
-                    await prod
-                except BaseException:
-                    pass
-                while not queue.empty():
-                    try:
-                        it = queue.get_nowait()
-                    except Exception:
-                        break
-                    if isinstance(it, tuple):
-                        clean_tmp(it[1])
+        if topics:
+            await copy_topics(client, src, dst, opts, topics, status)
         else:
-            # sequential: download a group fully, then upload it (one transfer at a time)
-            group = []
-
-            async def flush():
-                nonlocal group
-                if not group:
-                    return
-                g, group = group, []
-                last_id = g[-1].id
-                job["dl_no"] = job["ul_no"] = done_count(job) + 1
-                await process_with_retry(dst, g, opts)
-                job["cur_id"] = last_id
-                save_progress(job["key"], last_id, done_count(job))
-                try:
-                    await asyncio.sleep(job["delay"])
-                    await refresh(status)
-                except Exception:
-                    pass
-
-            async for m in client.iter_messages(src, reverse=True, min_id=min_id):
-                if job["stop"]:
-                    break
-                if m.action:
-                    continue
-                if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
-                    group.append(m)
-                    continue
-                await flush()
-                group = [m]
-            if group and not job["stop"]:
-                await flush()
+            try:
+                job["total_msgs"] = getattr(await client.get_messages(src, limit=0), "total", 0) or 0
+            except Exception:
+                job["total_msgs"] = 0
+            latest = await client.get_messages(src, limit=1)
+            job["top_id"] = max(latest[0].id if latest else min_id, min_id)
+            await copy_messages(client, src, dst, opts, None, min_id, status)
         job["phase"] = "stopped" if job["stop"] else "done"
     except BadInput as e:
         job["phase"] = "error"
@@ -1463,7 +1644,8 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         job["last_result"] = render_job()
         if status is not None:
             await refresh(status, force=True)
-            if job["phase"] == "done" and job["done"] == 0 and job["failed"] == 0 and job["skipped"] == 0:
+            if (job["phase"] == "done" and not job.get("topic_total")
+                    and job["done"] == 0 and job["failed"] == 0 and job["skipped"] == 0):
                 await say(f"ℹ️ There was nothing new to copy after message ID {min_id}.\n"
                           "To copy from the very beginning, run /copy again and choose 'From the beginning'.")
             else:
@@ -1525,7 +1707,8 @@ def build_opts(conv):
         footer = (ftext, fents, conv["footer_pos"])
     return {"rules": rules, "scope": conv["scope"] or "both", "link_rules": link_rules,
             "thumb": conv["thumb"], "footer": footer,
-            "base_done": conv.get("base_done") or 0}
+            "base_done": conv.get("base_done") or 0,
+            "resume": bool(conv.get("resume"))}
 
 
 async def _run_in_session(sess, coro):
@@ -2382,7 +2565,21 @@ async def on_button(event):
         await event.answer("This request has expired. Please start again.", alert=True)
 
     try:
-        if data in ("job:retry", "job:skip", "job:stop"):
+        if data in ("tp:copy", "tp:skip", "tp:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done():
+                return await expired()
+            await event.answer()
+            try:
+                await event.edit({"tp:copy": "✅ Copying this topic…",
+                                  "tp:skip": "⏭ Skipping this topic.",
+                                  "tp:stop": "🛑 Stopping the copy."}[data])
+            except Exception:
+                pass
+            if data == "tp:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data in ("job:retry", "job:skip", "job:stop"):
             fut = sess.job.get("pending")
             if fut is None or fut.done():
                 return await expired()
@@ -2450,8 +2647,9 @@ async def on_button(event):
         elif data in ("start:begin", "start:resume") and step == "start":
             await event.answer()
             if data == "start:begin":
-                conv.update(start=0, start_label="the beginning", base_done=0)
+                conv.update(start=0, start_label="the beginning", base_done=0, resume=False)
             else:
+                conv["resume"] = True
                 key = f"{conv['src_id']}->{conv['dst_id']}"
                 last_id, done_n = progress_entry(key)
                 conv.update(start=last_id, base_done=done_n,
