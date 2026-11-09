@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections import defaultdict
-from typing import Optional, List, AsyncGenerator, Union, Awaitable, DefaultDict, Tuple, BinaryIO
+from typing import Optional, List, Union, DefaultDict, Tuple, BinaryIO
 
 from telethon import utils, helpers, TelegramClient
 from telethon.crypto import AuthKey
@@ -45,65 +45,11 @@ TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLoca
                      InputFileLocation, InputPhotoFileLocation]
 
 
-class DownloadSender:
-    client: TelegramClient
-    sender: MTProtoSender
-    request: GetFileRequest
-    remaining: int
-    stride: int
-
-    def __init__(self, client: TelegramClient, sender: MTProtoSender, file: TypeLocation, offset: int, limit: int,
-                 stride: int, count: int, connect: callable = None) -> None:
-        self.sender = sender
-        self.client = client
-        self.request = GetFileRequest(file, offset=offset, limit=limit)
-        self.stride = stride
-        self.remaining = count
-        self.connect = connect       # makes a fresh connection if this one dies
-
-    async def next(self) -> Optional[bytes]:
-        if not self.remaining:
-            return None
-        # One dead connection used to fail the whole parallel download, dropping the transfer
-        # to the slow single-connection path. Reconnect and retry this part instead.
-        last = None
-        for attempt in range(3):
-            try:
-                result = await self.client._call(self.sender, self.request)
-                self.remaining -= 1
-                self.request.offset += self.stride
-                return result.bytes
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                last = e
-                if attempt == 2 or self.connect is None:
-                    break
-                # printed, not log.debug: telethon's logger is quietened once connected, and
-                # without this a connection that keeps dying is invisible while it slows
-                # every batch down to its own retry speed
-                print(f"Download part at offset {self.request.offset} failed "
-                      f"({type(e).__name__}: {e}); reconnecting (attempt {attempt + 1}/3)",
-                      flush=True)
-                try:
-                    await self.sender.disconnect()
-                except Exception:
-                    pass
-                try:
-                    self.sender = await self.connect()
-                except Exception:
-                    await asyncio.sleep(1)
-        raise last
-
-    def disconnect(self) -> Awaitable[None]:
-        return self.sender.disconnect()
-
-
 class ParallelTransferrer:
     client: TelegramClient
     loop: asyncio.AbstractEventLoop
     dc_id: int
-    senders: Optional[List[Union[DownloadSender, MTProtoSender]]]
+    senders: Optional[List[MTProtoSender]]
     auth_key: AuthKey
 
     def __init__(self, client: TelegramClient, dc_id: Optional[int] = None) -> None:
@@ -128,37 +74,11 @@ class ParallelTransferrer:
             return max_count
         return max(1, math.ceil((file_size / full_size) * max_count))
 
-    async def _init_download(self, connections: int, file: TypeLocation, part_count: int,
-                             part_size: int) -> None:
-        minimum, remainder = divmod(part_count, connections)
-
-        def get_part_count() -> int:
-            nonlocal remainder
-            if remainder > 0:
-                remainder -= 1
-                return minimum + 1
-            return minimum
-
-        # The first cross-DC sender will export+import the authorization, so we always create it
-        # before creating any other senders.
-        self.senders = [
-            await self._create_download_sender(file, 0, part_size, connections * part_size,
-                                               get_part_count()),
-            *await asyncio.gather(
-                *[self._create_download_sender(file, i, part_size, connections * part_size,
-                                               get_part_count())
-                  for i in range(1, connections)])
-        ]
-
-    async def _create_download_sender(self, file: TypeLocation, index: int, part_size: int,
-                                      stride: int,
-                                      part_count: int) -> DownloadSender:
-        return DownloadSender(self.client, await self._create_sender(), file, index * part_size, part_size,
-                              stride, part_count, connect=self._create_sender)
-
-    async def init_upload_senders(self, connections: int) -> List[MTProtoSender]:
-        """Plain connections for uploading. Parts are handed out by a worker pool
-        (see _internal_transfer_to_telegram) so a slow connection can't hold up the rest."""
+    async def init_senders(self, connections: int) -> List[MTProtoSender]:
+        """Plain connections. Parts are handed out by a worker pool in both directions, so a
+        slow or dying connection can only delay its own part.
+        The first sender is made alone because a cross-datacentre one exports the
+        authorization that the others then reuse."""
         first = await self._create_sender()
         rest = (await asyncio.gather(*[self._create_sender() for _ in range(1, connections)])
                 if connections > 1 else [])
@@ -181,37 +101,50 @@ class ParallelTransferrer:
             self.auth_key = sender.auth_key
         return sender
 
-    async def download(self, file: TypeLocation, file_size: int,
-                       part_size_kb: Optional[float] = None,
-                       connection_count: Optional[int] = None) -> AsyncGenerator[bytes, None]:
-        connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = int(part_size_kb or PART_KB) * 1024
-        part_count = math.ceil(file_size / part_size)
-        log.debug("Starting parallel download: "
-                  f"{connection_count} {part_size} {part_count} {file!s}")
-        await self._init_download(connection_count, file, part_count, part_size)
+    async def run_pool(self, connections: int, part_count: int, do_part: callable,
+                       on_error: list) -> None:
+        """Hands out part numbers to the connections. Whoever is free takes the next one, so a
+        connection that is retrying only delays its own part instead of the whole transfer."""
+        queue: asyncio.Queue = asyncio.Queue()
+        for i in range(part_count):
+            queue.put_nowait(i)
 
-        # NOTE: cleanup is done by the caller (download_file), NOT in a finally here.
-        # Awaiting inside an async generator's finally during GeneratorExit raises
-        # "RuntimeError: coroutine ignored GeneratorExit", which could crash the whole copy.
-        part = 0
-        while part < part_count:
-            tasks = [self.loop.create_task(sender.next()) for sender in self.senders]
-            # gather awaits every task, so a failure or an early end can no longer leave tasks
-            # running unawaited ("Task exception was never retrieved") with leaked connections
-            chunks = await asyncio.gather(*tasks, return_exceptions=True)
-            for c in chunks:
-                if isinstance(c, BaseException):
-                    raise c
-            stop = False
-            for data in chunks:
-                if not data:
-                    stop = True
-                    break
-                yield data
-                part += 1
-            if stop:
-                break
+        async def worker(slot: int):
+            while not on_error:
+                try:
+                    index = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                for attempt in range(3):
+                    try:
+                        await do_part(slot, index)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        if attempt == 2:
+                            on_error.append(e)
+                            return
+                        print(f"Part {index} failed ({type(e).__name__}: {e}); "
+                              f"reconnecting (attempt {attempt + 1}/3)", flush=True)
+                        try:
+                            await self.senders[slot].disconnect()
+                        except Exception:
+                            pass
+                        try:
+                            self.senders[slot] = await self._create_sender()
+                        except Exception:
+                            await asyncio.sleep(1)
+
+        workers = [asyncio.ensure_future(worker(i)) for i in range(connections)]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for w in workers:
+                if not w.done():
+                    w.cancel()
+            # every task is awaited, so none is ever left running and unretrieved
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
@@ -239,7 +172,7 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
 
     uploader = ParallelTransferrer(client)
     connections = max(1, min(uploader._get_connection_count(file_size), part_count or 1))
-    senders = await uploader.init_upload_senders(connections)
+    senders = await uploader.init_senders(connections)
     log.debug(f"Starting parallel upload: {connections} {part_size} {part_count}")
 
     # Worker pool: every connection pulls the next part as soon as it is free. The previous
@@ -337,21 +270,54 @@ async def download_file(client: TelegramClient,
                   flush=True)
         else:
             print(f"Parallel download is same-datacentre (DC {home}).", flush=True)
+    part_size = PART_KB * 1024
+    part_count = max(1, math.ceil(size / part_size))
+
     # Lock per account: Telegram limits concurrent connections, so one parallel
     # transfer at a time per client avoids "server closed the connection" errors.
     async with parallel_transfer_locks[("dl", id(client))]:
         downloader = ParallelTransferrer(client, dc_id)
+        connections = max(1, min(downloader._get_connection_count(size), part_count))
+        await downloader.init_senders(connections)
+        log.debug(f"Starting parallel download: {connections} {part_size} {part_count}")
+
+        got = [0]
+        errors = []
+        write_lock = asyncio.Lock()
+
+        async def fetch(slot: int, index: int):
+            offset = index * part_size
+            result = await client._call(downloader.senders[slot],
+                                        GetFileRequest(location, offset=offset, limit=part_size))
+            data = result.bytes
+            # each part goes straight to its own place in the file, so parts can arrive in any
+            # order and one slow connection never holds the others up
+            async with write_lock:
+                out.seek(offset)
+                out.write(data)
+                got[0] += len(data)
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.5)
+                r = progress_callback(min(got[0], size), size)
+                if inspect.isawaitable(r):
+                    await r
+
+        tick = asyncio.ensure_future(ticker()) if progress_callback else None
         try:
-            async for x in downloader.download(location, size):
-                out.write(x)
-                if progress_callback:
-                    r = progress_callback(out.tell(), size)
-                    if inspect.isawaitable(r):
-                        await r
+            await downloader.run_pool(connections, part_count, fetch, errors)
         finally:
-            # clean up the parallel connections here (outside the generator) so a half-consumed
-            # download never raises "coroutine ignored GeneratorExit"
+            if tick is not None:
+                tick.cancel()
             await downloader._cleanup()
+
+        if errors:
+            raise errors[0]
+        if progress_callback:
+            r = progress_callback(size, size)
+            if inspect.isawaitable(r):
+                await r
     return out
 
 
