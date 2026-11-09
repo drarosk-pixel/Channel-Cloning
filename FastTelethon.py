@@ -77,7 +77,12 @@ class DownloadSender:
                 last = e
                 if attempt == 2 or self.connect is None:
                     break
-                log.debug(f"Part at offset {self.request.offset} failed ({e}); reconnecting")
+                # printed, not log.debug: telethon's logger is quietened once connected, and
+                # without this a connection that keeps dying is invisible while it slows
+                # every batch down to its own retry speed
+                print(f"Download part at offset {self.request.offset} failed "
+                      f"({type(e).__name__}: {e}); reconnecting (attempt {attempt + 1}/3)",
+                      flush=True)
                 try:
                     await self.sender.disconnect()
                 except Exception:
