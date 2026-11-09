@@ -39,6 +39,8 @@ MAX_CONNECTIONS = int(os.environ.get("FT_CONNECTIONS", "8"))
 _p = int(os.environ.get("FT_PART_KB", "512"))
 PART_KB = max(4, min(512, _p - _p % 4))
 
+_DC_NOTED = False      # so the data-centre note is printed once, not per file
+
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
                      InputFileLocation, InputPhotoFileLocation]
 
@@ -322,6 +324,19 @@ async def download_file(client: TelegramClient,
                         ) -> BinaryIO:
     size = location.size
     dc_id, location = utils.get_input_location(location)
+    # Parallel download across data centres needs an exported authorization per connection,
+    # which is the fragile part. Say so once, because it decides whether USE_FAST_DL helps.
+    global _DC_NOTED
+    if not _DC_NOTED:
+        _DC_NOTED = True
+        home = client.session.dc_id
+        if dc_id != home:
+            print(f"Note: files live in data centre {dc_id} but the account is on {home}. "
+                  "Parallel download has to export an authorization per connection here; "
+                  "if downloads keep failing, set USE_FAST_DL=0 (upload stays parallel).",
+                  flush=True)
+        else:
+            print(f"Parallel download is same-datacentre (DC {home}).", flush=True)
     # Lock per account: Telegram limits concurrent connections, so one parallel
     # transfer at a time per client avoids "server closed the connection" errors.
     async with parallel_transfer_locks[("dl", id(client))]:
