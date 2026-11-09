@@ -780,9 +780,9 @@ def render_job():
 async def refresh(status, force=False):
     job = S().job
     now = time.time()
-    if now < job.get("edit_block_until", 0.0):
+    if now < (job.get("edit_block_until") or 0.0):
         return                      # Telegram told us to stop editing for a while
-    if not force and now - job["last_edit"] < EDIT_EVERY:
+    if not force and now - (job.get("last_edit") or 0.0) < EDIT_EVERY:
         return
     job["last_edit"] = now
     target = job.get("status_msg") or status
@@ -1663,8 +1663,15 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         tick = max(1.0, EDIT_EVERY / 2)   # so EDIT_EVERY alone controls how often /status refreshes
         try:
             while job["running"]:
-                force = job["flood_until"] > time.time()
-                await refresh(status, force=force)
+                # one bad update must never kill this task: that left the live status frozen
+                # for the rest of the copy while the transfer carried on
+                try:
+                    force = (job.get("flood_until") or 0) > time.time()
+                    await refresh(status, force=force)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"Status update problem: {type(e).__name__}: {e}", flush=True)
                 await asyncio.sleep(tick)
         except asyncio.CancelledError:
             pass
