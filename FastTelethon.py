@@ -51,20 +51,42 @@ class DownloadSender:
     stride: int
 
     def __init__(self, client: TelegramClient, sender: MTProtoSender, file: TypeLocation, offset: int, limit: int,
-                 stride: int, count: int) -> None:
+                 stride: int, count: int, connect: callable = None) -> None:
         self.sender = sender
         self.client = client
         self.request = GetFileRequest(file, offset=offset, limit=limit)
         self.stride = stride
         self.remaining = count
+        self.connect = connect       # makes a fresh connection if this one dies
 
     async def next(self) -> Optional[bytes]:
         if not self.remaining:
             return None
-        result = await self.client._call(self.sender, self.request)
-        self.remaining -= 1
-        self.request.offset += self.stride
-        return result.bytes
+        # One dead connection used to fail the whole parallel download, dropping the transfer
+        # to the slow single-connection path. Reconnect and retry this part instead.
+        last = None
+        for attempt in range(3):
+            try:
+                result = await self.client._call(self.sender, self.request)
+                self.remaining -= 1
+                self.request.offset += self.stride
+                return result.bytes
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last = e
+                if attempt == 2 or self.connect is None:
+                    break
+                log.debug(f"Part at offset {self.request.offset} failed ({e}); reconnecting")
+                try:
+                    await self.sender.disconnect()
+                except Exception:
+                    pass
+                try:
+                    self.sender = await self.connect()
+                except Exception:
+                    await asyncio.sleep(1)
+        raise last
 
     def disconnect(self) -> Awaitable[None]:
         return self.sender.disconnect()
@@ -125,7 +147,7 @@ class ParallelTransferrer:
                                       stride: int,
                                       part_count: int) -> DownloadSender:
         return DownloadSender(self.client, await self._create_sender(), file, index * part_size, part_size,
-                              stride, part_count)
+                              stride, part_count, connect=self._create_sender)
 
     async def init_upload_senders(self, connections: int) -> List[MTProtoSender]:
         """Plain connections for uploading. Parts are handed out by a worker pool
@@ -168,12 +190,21 @@ class ParallelTransferrer:
         part = 0
         while part < part_count:
             tasks = [self.loop.create_task(sender.next()) for sender in self.senders]
-            for task in tasks:
-                data = await task
+            # gather awaits every task, so a failure or an early end can no longer leave tasks
+            # running unawaited ("Task exception was never retrieved") with leaked connections
+            chunks = await asyncio.gather(*tasks, return_exceptions=True)
+            for c in chunks:
+                if isinstance(c, BaseException):
+                    raise c
+            stop = False
+            for data in chunks:
                 if not data:
+                    stop = True
                     break
                 yield data
                 part += 1
+            if stop:
+                break
 
 
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
