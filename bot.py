@@ -185,7 +185,7 @@ class UserSession:
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, pending_kind="", paused=False, pending_id=0,
             fast_note="", refresh_refs=False,
-            base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0,
+            base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
             send_block_until=0.0,
             topic_name="", topic_idx=0, topic_total=0,
         )
@@ -784,13 +784,21 @@ async def refresh(status, force=False):
         return                      # Telegram told us to stop editing for a while
     if not force and now - (job.get("last_edit") or 0.0) < EDIT_EVERY:
         return
-    job["last_edit"] = now
     target = job.get("status_msg") or status
     if target is None:
         return
+    text = render_job()
+    # Once elapsed passes an hour it only changes every minute, so during a stalled transfer
+    # the whole text can stay identical. Editing it then returns "message was not modified",
+    # which used to be counted as a failure and answered with a brand new status message every
+    # few seconds: that froze the message being watched and eventually got sending rate-limited.
+    if text == job.get("last_text"):
+        return
+    job["last_edit"] = now
     try:
-        await target.edit(render_job(), parse_mode=None)
+        await target.edit(text, parse_mode=None)
         job["status_msg"] = target
+        job["last_text"] = text
         job["edit_fails"] = 0
     except FloodWaitError as e:
         # editing one message for hours gets the whole chat rate-limited, which used to freeze
@@ -799,14 +807,20 @@ async def refresh(status, force=False):
         print(f"Status edits paused for {e.seconds}s (Telegram rate limit); the copy continues.",
               flush=True)
     except Exception as e:
+        if type(e).__name__ == "MessageNotModifiedError" or "not modified" in str(e).lower():
+            job["last_text"] = text     # nothing to change; not a failure
+            return
         n = job.get("edit_fails", 0) + 1
         job["edit_fails"] = n
         if n == 1:
             print(f"Status update failed: {type(e).__name__}: {e}", flush=True)
         if n >= 3:
-            # the old message can no longer be edited: post a fresh one instead of going silent
+            # the old message really can't be edited any more: post a fresh one rather than
+            # going silent, and only once per three failures
             try:
-                job["status_msg"] = await say(render_job())
+                fresh = await say(text)
+                if fresh is not None:
+                    job["status_msg"] = fresh
                 job["edit_fails"] = 0
             except Exception:
                 pass
