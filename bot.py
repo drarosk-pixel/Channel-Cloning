@@ -107,6 +107,11 @@ USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
 # If a transfer makes no progress for this many seconds, treat the connection as dead,
 # abort that attempt and retry (so one stuck file can't freeze the copy for hours).
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
+# Give up on parallel download for the rest of a task after this many files fail in a row.
+FAST_DL_GIVE_UP = int(os.environ.get("FAST_DL_GIVE_UP", "3"))
+# Telethon's own log level. Raise to WARNING to see the real RPC errors behind
+# "Request was unsuccessful N time(s)".
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "ERROR").upper()
 # How many times to auto-retry a stalled transfer before asking the user what to do.
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
 
@@ -184,7 +189,7 @@ class UserSession:
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, pending_kind="", paused=False, pending_id=0,
-            fast_note="", refresh_refs=False,
+            fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False,
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
             send_block_until=0.0,
             topic_name="", topic_idx=0, topic_total=0,
@@ -1033,7 +1038,8 @@ async def download_one(client, m, tmp, idx, names, dcb):
     job = S().job
     job["dl_tot"] = size
     job["dl_cur"] = 0
-    if USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN:
+    if (USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN
+            and not job.get("fast_dl_off")):
         job["dl_mode"] = "fast"
         fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
         path = os.path.join(sub, fname)
@@ -1047,6 +1053,7 @@ async def download_one(client, m, tmp, idx, names, dcb):
                 with open(path, "wb") as out:
                     await fast_download(client, doc, out, progress_callback=dcb)
                 job["fast_note"] = ""
+                job["fast_dl_fails"] = 0      # it works, so forget earlier hiccups
                 return path
             except FloodWaitError:
                 raise
@@ -1062,6 +1069,16 @@ async def download_one(client, m, tmp, idx, names, dcb):
                 note = f"fast download failed: {type(e).__name__}: {e}"
                 job["fast_note"] = note[:160]
                 print(f"Message {m.id}: {note} -> using normal (slower) download", flush=True)
+                # Some networks simply cannot open extra connections to the file's data
+                # centre. Trying anyway costs minutes per file, so after a few files in a row
+                # give up on the parallel path for this task instead of paying that each time.
+                job["fast_dl_fails"] = job.get("fast_dl_fails", 0) + 1
+                if job["fast_dl_fails"] >= FAST_DL_GIVE_UP:
+                    job["fast_dl_off"] = True
+                    job["fast_note"] = ("parallel download isn't working here; "
+                                        "using normal download for the rest of this task")
+                    print(f"Parallel download failed on {job['fast_dl_fails']} files in a row; "
+                          "switching to normal download for the rest of this task.", flush=True)
                 break
     else:
         job["fast_note"] = f"fast download off: {why_no_fast(USE_FAST_DL, fast_download, size)}"
@@ -3012,7 +3029,7 @@ async def main():
         uname = "?"
     # connected — now quiet the per-transfer connection noise, and stop the bot from sleeping a
     # long time on its own flood waits (e.g. frequent status edits) which made it respond late
-    logging.getLogger("telethon").setLevel(logging.ERROR)
+    logging.getLogger("telethon").setLevel(getattr(logging, LOG_LEVEL, logging.ERROR))
     bot.flood_sleep_threshold = 30
     print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
     print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
