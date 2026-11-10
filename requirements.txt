@@ -1,2 +1,4 @@
 telethon
+cryptg
 hachoir
+Pillow

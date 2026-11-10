@@ -1,16 +1,23 @@
+import io
 import os
 import re
 import sys
+import inspect
 import json
 import time
 import copy
 import shutil
 import struct
 import asyncio
+import logging
 import tempfile
+import contextvars
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError,
+    PhoneCodeExpiredError, PhoneNumberInvalidError, PasswordHashInvalidError,
+)
 from telethon.extensions import markdown as tl_markdown
 from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import ToggleNoForwardsRequest
@@ -18,9 +25,40 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import (
     MessageMediaWebPage, MessageMediaPoll, Channel, PeerChannel,
     BotCommand, BotCommandScopeDefault,
+    DocumentAttributeFilename, DocumentAttributeVideo,
+    PhotoSize, PhotoSizeProgressive, InputDocumentFileLocation,
 )
 
-VERSION = "v7"
+try:
+    # parallel multi-connection transfer (much faster up/downloads for large files)
+    from FastTelethon import upload_file as fast_upload, download_file as fast_download
+    FAST_IMPORT_ERROR = None
+except Exception as _e:
+    # don't hide this: without it every transfer silently uses the slow single-connection path
+    fast_upload = None
+    fast_download = None
+    FAST_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+VERSION = "v11"
+
+# Telegram moved the "list forum topics" call between API namespaces, and renamed its first
+# argument from `channel` to `peer`, so find whichever this Telethon version ships instead of
+# guessing. Topic support simply switches off if it isn't available.
+GetForumTopicsRequest = None
+for _ns in ("channels", "messages"):
+    try:
+        GetForumTopicsRequest = getattr(
+            __import__(f"telethon.tl.functions.{_ns}", fromlist=["GetForumTopicsRequest"]),
+            "GetForumTopicsRequest")
+        break
+    except Exception:
+        continue
+
+
+def forum_topics_request(ent, **kw):
+    params = inspect.signature(GetForumTopicsRequest.__init__).parameters
+    first = "channel" if "channel" in params else "peer"
+    return GetForumTopicsRequest(**{first: ent}, **kw)
 
 
 def need(name):
@@ -37,54 +75,145 @@ except ValueError:
     print("ERROR: API_ID must be a number (get it from my.telegram.org).")
     sys.exit(1)
 api_hash = need("API_HASH")
-session = need("SESSION_STRING")
 bot_token = need("BOT_TOKEN")
 
 RESTRICT = os.environ.get("RESTRICT", "1") == "1"            # channels created by /create are restricted
 MAX_COUNT = int(os.environ.get("MAX_COUNT", "50"))           # max channels per /create
 CREATE_DELAY = float(os.environ.get("CREATE_DELAY", "3"))    # wait between created channels
 DELAY = float(os.environ.get("DELAY", "1.5"))                # wait between copied messages
-EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "4"))        # seconds between live status updates
+EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "6"))        # seconds between live status updates
 PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
+SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
+THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
+# Download temp files to the app's own (large, persistent) storage, NOT the system /tmp,
+# which is tiny on many hosts and causes "No space left on device" for big videos.
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", os.path.join(os.getcwd(), "dl_tmp"))
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+except Exception:
+    DOWNLOAD_DIR = None  # fall back to the system temp dir if we can't create it
+FAST_MIN = int(os.environ.get("FAST_UPLOAD_MB", "5")) * 1024 * 1024  # use parallel transfer above this size
+# Parallel multi-connection transfer. Greatly speeds up uploads (single-connection uploads are slow).
+# ON by default; set USE_FAST=0 to disable. Harmless connection noise is suppressed below.
+USE_FAST = os.environ.get("USE_FAST", "1") == "1"
+# PIPELINE=1: download the next file while uploading the current one (uses both directions, ~2x).
+# PIPELINE=0 (default): strictly one at a time (download, then upload). Fewer simultaneous
+# connections = more stable. Connection warnings are silenced either way.
+PIPELINE = os.environ.get("PIPELINE", "0") == "1"
+# Parallel DOWNLOAD via FastTelethon (on by default). With sequential mode (PIPELINE=0) only one
+# transfer runs at a time, so the connection count stays low and stays stable.
+USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
+# If a transfer makes no progress for this many seconds, treat the connection as dead,
+# abort that attempt and retry (so one stuck file can't freeze the copy for hours).
+STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
+# Give up on parallel download for the rest of a task after this many files fail in a row.
+FAST_DL_GIVE_UP = int(os.environ.get("FAST_DL_GIVE_UP", "3"))
+# Telethon's own log level. Raise to WARNING to see the real RPC errors behind
+# "Request was unsuccessful N time(s)".
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "ERROR").upper()
+# How many times to auto-retry a stalled transfer before asking the user what to do.
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
 
-# `client` = your own Telegram account (does the real work: creating channels, copying content)
-# `bot`    = the BotFather bot you chat with (receives commands and shows progress)
-client = TelegramClient(StringSession(session), api_id, api_hash)
-bot = TelegramClient(StringSession(), api_id, api_hash)
+
+# ---- quiet the harmless asyncio/connection noise from parallel transfer senders ----
+_orig_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    exc = getattr(unraisable, "exc_value", None)
+    if isinstance(exc, GeneratorExit):
+        return
+    if isinstance(exc, RuntimeError) and "GeneratorExit" in str(exc):
+        return
+    _orig_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
+
+# `bot` = the BotFather bot everyone chats with (receives commands, shows progress).
+# Each user logs in with /login; their own Telegram account then does the real work.
+# A PERSISTENT session file means the bot authorizes with Telegram only once; later restarts
+# reuse it, so rapid restarts can't trigger Telegram's bot-authorization rate limit (flood).
+# flood_sleep_threshold lets Telethon wait out a flood automatically instead of hammering it.
+BOT_SESSION = os.environ.get("BOT_SESSION", "bot")
+bot = TelegramClient(BOT_SESSION, api_id, api_hash, flood_sleep_threshold=3600)
 bot.parse_mode = None  # bot messages are plain text
-
-my_id = None
-my_name = "there"
-started_at = time.time()
-dialogs_loaded = False
 
 
 class BadInput(Exception):
     pass
 
 
-# ----------------------------- state -----------------------------
-conv = {}
+# ----------------------------- per-user session -----------------------------
+class UserSession:
+    """Everything that belongs to one logged-in (or logging-in) user."""
+
+    def __init__(self, uid):
+        self.user_id = uid
+        self.name = "there"
+        self.client = None          # the user's own Telegram account client
+        self.login_client = None     # temporary client used during /login
+        self.dialogs_loaded = False
+        self.chan_cache = {}        # {"all"/"admin": (timestamp, [(id, title), ...])}
+        self.started_at = time.time()
+        self.conv = {}
+        self.job = {}
+        self.reset_conv()
+        self.reset_job()
+
+    def reset_conv(self):
+        self.conv.clear()
+        self.conv.update(
+            kind=None, step=None,
+            src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
+            start=None, start_label="", base_done=0, resume=False,
+            topics=None, topic_id=None, topic_name="", topic_page=0,
+            rules=[], scope="both", link_rules=[],
+            thumb=None, footer_text=None, footer_pos="append",
+            name="", count=0,
+            phone=None, phone_code_hash=None,
+            pick_src=[], pick_src_all=[], pick_src_page=0,
+            pick_dst=[], pick_dst_all=[], pick_dst_page=0,
+        )
+
+    def reset_job(self):
+        self.job.clear()
+        self.job.update(
+            running=False, stop=False, kind=None, phase="idle", last_edit=0.0,
+            started=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
+            cur_id=0, min_id=0, top_id=0, errors=[], flood_until=0.0,
+            rules_n=0, scope="both", link_n=0, has_thumb=False, has_footer=False,
+            name="", total=0, total_msgs=0, key="", last_result="", delay=DELAY,
+            force_dl=False,
+            dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
+            ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
+            pending=None, pending_kind="", paused=False, pending_id=0,
+            fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False,
+            base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
+            send_block_until=0.0,
+            topic_name="", topic_idx=0, topic_total=0,
+        )
 
 
-def reset_conv():
-    conv.clear()
-    conv.update(kind=None, step=None,
-                src=None, src_id=None, src_title="", dst=None, dst_id=None, dst_title="",
-                start=None, start_label="", rules=None, scope=None,
-                name="", count=0)
+sessions = {}
+_cur = contextvars.ContextVar("current_session")
 
 
-reset_conv()
-
-job = {"running": False, "stop": False, "kind": None, "phase": "idle", "last_edit": 0.0,
-       "started": 0.0, "src": "", "dst": "", "done": 0, "failed": 0, "skipped": 0,
-       "cur_id": 0, "min_id": 0, "top_id": 0, "errors": [], "flood_until": 0.0,
-       "rules_n": 0, "scope": "both", "name": "", "total": 0, "key": "", "last_result": ""}
+def S():
+    """The session for the user currently being served."""
+    return _cur.get()
 
 
-# ----------------------------- small helpers -----------------------------
+def get_sess(uid):
+    s = sessions.get(uid)
+    if s is None:
+        s = UserSession(uid)
+        sessions[uid] = s
+    return s
+
+
+# ----------------------------- persistence -----------------------------
 def jload(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -101,22 +230,52 @@ def jsave(path, data):
         pass
 
 
-def save_progress(key, last_id):
+session_strings = jload(SESSIONS_FILE)   # {str(user_id): session_string}
+
+
+def save_sessions():
+    jsave(SESSIONS_FILE, session_strings)
+
+
+def save_progress(key, last_id, count=0):
     data = jload(PROGRESS_FILE)
-    data[key] = last_id
+    data.setdefault(str(S().user_id), {})[key] = {"id": last_id, "n": count}
     jsave(PROGRESS_FILE, data)
 
 
+def progress_map():
+    return jload(PROGRESS_FILE).get(str(S().user_id), {})
+
+
+def progress_entry(key):
+    """(last message id, how many were already copied). Older progress files stored
+    just the id, so handle both shapes."""
+    v = progress_map().get(key)
+    if isinstance(v, dict):
+        return int(v.get("id") or 0), int(v.get("n") or 0)
+    return int(v or 0), 0
+
+
 def get_setting(name, default=None):
-    return jload(SETTINGS_FILE).get(name, default)
+    return jload(SETTINGS_FILE).get(str(S().user_id), {}).get(name, default)
 
 
 def set_setting(name, value):
     data = jload(SETTINGS_FILE)
-    data[name] = value
+    data.setdefault(str(S().user_id), {})[name] = value
     jsave(SETTINGS_FILE, data)
 
 
+def get_delay():
+    """Per-user delay (seconds) between copied messages; defaults to the DELAY env var."""
+    try:
+        v = float(get_setting("delay", DELAY))
+    except Exception:
+        v = DELAY
+    return min(10.0, max(0.3, v))
+
+
+# ----------------------------- small helpers -----------------------------
 def fmt_duration(sec):
     sec = int(max(sec, 0))
     h, r = divmod(sec, 3600)
@@ -126,6 +285,14 @@ def fmt_duration(sec):
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def fmt_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
 
 
 def title_of(ent):
@@ -138,66 +305,140 @@ def bar(pct, width=12):
     return "█" * filled + "░" * (width - filled)
 
 
-async def say(text, **kw):
-    return await bot.send_message(my_id, text, link_preview=False, **kw)
+async def say(text, critical=False, **kw):
+    """Send a message to the user. Telegram sometimes rate-limits sending for a long time;
+    that must never kill a running copy, so note the wait for /status and either skip this
+    message (a notice) or wait it out and retry (a prompt the copy depends on)."""
+    try:
+        return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+    except FloodWaitError as e:
+        job = S().job
+        job["send_block_until"] = time.time() + e.seconds + 1
+        print(f"Telegram wants {e.seconds}s before the bot can send again"
+              f"{'; waiting and retrying' if critical else '; skipping this notice'}"
+              " — the copy keeps running.", flush=True)
+        if not critical:
+            return None
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            return await bot.send_message(S().user_id, text, link_preview=False, **kw)
+        except Exception as e2:
+            print(f"Could not send after the wait: {type(e2).__name__}: {e2}", flush=True)
+            return None
+    except Exception as e:
+        print(f"Could not send message: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# ----------------------------- user client lifecycle -----------------------------
+async def ensure_client(sess):
+    """Returns a connected, authorized client for the user, or None if not logged in."""
+    if sess.client is None:
+        ss = session_strings.get(str(sess.user_id))
+        if not ss:
+            return None
+        sess.client = TelegramClient(StringSession(ss), api_id, api_hash)
+    try:
+        if not sess.client.is_connected():
+            await sess.client.connect()
+        if not await sess.client.is_user_authorized():
+            sess.client = None
+            session_strings.pop(str(sess.user_id), None)
+            save_sessions()
+            return None
+    except Exception:
+        return None
+    return sess.client
+
+
+async def require_login(sess):
+    c = await ensure_client(sess)
+    if not c:
+        await say("🔒 You need to log in first.\nSend /login to connect your Telegram account.")
+        return False
+    if sess.name == "there":
+        try:
+            me = await c.get_me()
+            sess.name = me.first_name or "there"
+        except Exception:
+            pass
+    return True
 
 
 # ----------------------------- texts -----------------------------
 WELCOME = (
     "👋 Welcome, {name}!\n\n"
-    "I'm your Channel Tools Assistant. I can:\n"
-    "• Copy all content (videos, photos, files, text) from one channel to another, "
-    "optionally replacing words in captions and file names.\n"
+    "I'm your Channel Tools Assistant. After you log in with your own Telegram account, I can:\n"
+    "• Copy all content (videos, photos, files, text) from one channel to another, with extras: "
+    "replace words, replace hidden hyperlink URLs, set a custom thumbnail, and add a caption / promo link.\n"
     "• Create several private channels with the same name in one go.\n\n"
-    "Send /copy or /create to begin. I'll guide you step by step.\n"
+    "First send /login to connect your account. Then send /copy or /create.\n"
     "Send /help for the full guide."
 )
 
 HELP = (
     "🤖 Channel Tools Assistant — Help\n\n"
     "Commands\n"
+    "/login - Connect your Telegram account to the bot\n"
+    "/logout - Disconnect your account\n"
     "/copy - Copy content from one channel to another (guided)\n"
     "/create - Create multiple private channels (guided)\n"
-    "/status - Live progress of the current task\n"
+    "/status - Live progress (with speed) of your current task\n"
+    "/speed - Set the delay between messages (e.g. /speed 0.8)\n"
     "/errors - Detailed list of recent errors\n"
-    "/stop - Stop the current task (or discard a draft)\n"
+    "/stop - Stop your current task (or discard a draft)\n"
     "/ping - Check that I'm online\n"
     "/about - About this assistant\n"
     "/help - Show this message\n\n"
+    "Logging in\n"
+    "1. Send /login.\n"
+    "2. Send your phone number in international format (e.g. +919876543210).\n"
+    "3. Enter the login code. Type it with spaces or dashes between the digits "
+    "(e.g. 1 2 3 4 5) so Telegram doesn't block it.\n"
+    "4. If you use two-step verification, enter your password.\n\n"
     "Copying content\n"
     "1. Send /copy.\n"
-    "2. Send the source channel (ID, @username, or forward any message from it).\n"
-    "3. Send the destination channel the same way.\n"
-    "4. Choose where to start: the beginning, a message ID, or resume the last run.\n"
-    "5. Optionally add word replacements, then tap Start.\n"
+    "2. Pick the source channel from the buttons (or send an ID/@username, or forward a message).\n"
+    "3. Pick the destination the same way (your admin channels are listed).\n"
+    "4. Choose where to start: the beginning, a message ID, or resume.\n"
+    "5. Open the Extras menu (all optional), then tap Done and Start.\n"
     "Shortcut: /copy <source> <destination> [message id]\n\n"
-    "Replacing words (optional)\n"
-    "Send one rule per line in the format: old word => new word\n"
-    "Example:\n"
-    "Lecture => Class\n"
-    "@oldchannel => @newchannel\n"
-    "Leave the right side empty to remove a word. Matching ignores upper/lower case. "
-    "Rules can be applied to captions and text, to file names, or both. "
-    "File extensions are never changed. "
-    "Renaming a file means it must be downloaded and uploaded again, so those files take longer.\n\n"
+    "Extras (optional)\n"
+    "• Replace words — in captions/text and/or file names. One rule per line: old => new. "
+    "Leave the right side empty to remove a word. Case-insensitive.\n"
+    "• Replace links — rewrite the hidden URL inside hyperlinks. One rule per line: "
+    "old => new (e.g. t.me/oldchannel => t.me/newchannel).\n"
+    "• Thumbnail — send a photo; it's used as the thumbnail for copied videos/documents "
+    "(those files are re-uploaded, so they take longer).\n"
+    "• Caption / promo link — extra text added to every caption. Use markdown for a "
+    "clickable promo link: [Join here](https://t.me/yourchannel). Choose append or prepend.\n\n"
     "Creating channels\n"
     "Send /create, then the channel name and the number of channels. "
     "Shortcut: /create <name> <number>\n\n"
     "Channel IDs\n"
     "Private channel IDs start with -100 (for example -1001234567890). "
-    "You can also simply forward any message from the channel to me and I'll read the ID.\n\n"
+    "You can also forward any message from the channel to me.\n\n"
     "Good to know\n"
     "• Your account must be a member of the source and an admin of the destination.\n"
-    "• Only one task runs at a time.\n"
+    "• Only one task runs at a time per user.\n"
     "• A stopped or failed copy can be resumed from where it left off.\n"
-    "• Errors are shown in /status together with their error name and code.\n"
-    "• This assistant works only for its owner."
+    "• Speed: use /speed to lower the delay (e.g. 0.8s). If Telegram pauses you "
+    "(flood wait), /status shows a live countdown and the copy resumes automatically "
+    "from the same message when the wait ends.\n"
+    "• Topic groups: if the source is a topic (forum) group, I go through the topics one at a "
+    "time starting from the bottom of the list, and ask before each one. Choosing Copy sends "
+    "the topic title to the destination first, then its content. Each topic keeps its own "
+    "count and its own resume point. Plain channels are unaffected.\n"
+    "• Protected/private sources: the bot detects these and goes straight to "
+    "download-and-upload mode (no wasted attempt). /status shows live download/upload "
+    "percentage and speed for the current file."
 )
 
 ABOUT = (
     f"ℹ️ Channel Tools Assistant {VERSION}\n\n"
-    "Copies channel content with optional word replacement (captions and file names) "
-    "and creates multiple channels. Use /help for instructions."
+    "Log in with your own Telegram account, then copy channel content with extras "
+    "(replace words, replace hyperlink URLs, custom thumbnail, caption/promo link) "
+    "and create multiple channels. Use /help for instructions."
 )
 
 GREETING_RE = re.compile(r"^(hi+|hello+|hey+|hola|namaste|good\s+(morning|afternoon|evening))\b", re.I)
@@ -224,12 +465,12 @@ def check_ref(token, label):
 
 
 async def resolve(ref, label):
-    global dialogs_loaded
-    if not dialogs_loaded:
-        await client.get_dialogs()
-        dialogs_loaded = True
+    sess = S()
+    if not sess.dialogs_loaded:
+        await sess.client.get_dialogs()
+        sess.dialogs_loaded = True
     try:
-        return await client.get_entity(ref)
+        return await sess.client.get_entity(ref)
     except Exception as e:
         raise BadInput(
             f"{label} could not be found ({ref}).\n"
@@ -247,7 +488,7 @@ def fwd_channel_id(msg):
     return None
 
 
-# ----------------------------- word replacement -----------------------------
+# ----------------------------- text / entity utilities -----------------------------
 def add_surrogate(text):
     """Python str -> UTF-16 units (Telegram entity offsets are UTF-16 based)."""
     return "".join(
@@ -261,6 +502,10 @@ def del_surrogate(text):
     return text.encode("utf-16", "surrogatepass").decode("utf-16")
 
 
+def utf16_len(text):
+    return len(add_surrogate(text or ""))
+
+
 class Rules:
     """Compiled word-replacement rules (case-insensitive, longest match first)."""
 
@@ -270,6 +515,11 @@ class Rules:
         self.pat_p = re.compile("|".join(re.escape(k) for k in sorted(self.d_p, key=len, reverse=True)), re.I)
         self.d_s = {add_surrogate(o).lower(): add_surrogate(n) for o, n in self.pairs}
         self.pat_s = re.compile("|".join(re.escape(k) for k in sorted(self.d_s, key=len, reverse=True)), re.I)
+
+    def sub_plain(self, text):
+        if not text:
+            return text
+        return self.pat_p.sub(lambda m: self.d_p.get(m.group(0).lower(), m.group(0)), text)
 
 
 def parse_rules(text):
@@ -333,10 +583,48 @@ def replace_in_text(raw_text, entities, rules):
     return del_surrogate(new_raw), new_ents
 
 
+def apply_link_rules(entities, link_rules):
+    """Rewrites the hidden URL inside hyperlink entities (e.g. [text](url))."""
+    if not link_rules:
+        return entities
+    out = []
+    for e in entities or []:
+        c = copy.copy(e)
+        url = getattr(c, "url", None)
+        if url:
+            c.url = link_rules.sub_plain(url)
+        out.append(c)
+    return out
+
+
+def apply_footer(raw_text, entities, footer):
+    """Adds an extra caption / promo text (with its own entities) to a message."""
+    if not footer:
+        return raw_text, list(entities or [])
+    ftext, fents, pos = footer
+    if not ftext:
+        return raw_text, list(entities or [])
+    text = raw_text or ""
+    ents = [copy.copy(e) for e in (entities or [])]
+    fe = [copy.copy(e) for e in (fents or [])]
+    sep = "\n\n" if text.strip() else ""
+    if pos == "prepend":
+        new_text = ftext + sep + text
+        shift = utf16_len(ftext + sep)
+        for e in ents:
+            e.offset += shift
+        return new_text, fe + ents
+    new_text = text + sep + ftext
+    shift = utf16_len(text + sep)
+    for e in fe:
+        e.offset += shift
+    return new_text, ents + fe
+
+
 def rename_file(name, rules):
     """Applies the rules to a file name (extension is never changed)."""
     stem, ext = os.path.splitext(name)
-    new = rules.pat_p.sub(lambda m: rules.d_p.get(m.group(0).lower(), m.group(0)), stem)
+    new = rules.sub_plain(stem)
     new = re.sub(r"[\\/\x00]", "_", new)
     new = re.sub(r"\s{2,}", " ", new).strip()
     if not new:
@@ -344,8 +632,26 @@ def rename_file(name, rules):
     return new + ext
 
 
+def normalize_thumb(src_path, dst_path):
+    """Makes a Telegram-friendly jpg thumbnail (<=320px). Falls back to a plain copy."""
+    try:
+        from PIL import Image
+        with Image.open(src_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            im.save(dst_path, "JPEG", quality=70)
+        return True
+    except Exception:
+        try:
+            shutil.copyfile(src_path, dst_path)
+            return True
+        except Exception:
+            return False
+
+
 # ----------------------------- errors -----------------------------
 def record_error(where, e):
+    job = S().job
     name = e.__class__.__name__
     code = getattr(e, "code", None)
     detail = (str(e) or name).replace("\n", " ")
@@ -355,6 +661,7 @@ def record_error(where, e):
 
 
 def err_lines(limit=5):
+    job = S().job
     agg = {}
     for e in job["errors"]:
         k = (e["name"], e["code"])
@@ -370,6 +677,7 @@ def err_lines(limit=5):
 
 # ----------------------------- status rendering -----------------------------
 def render_job():
+    job = S().job
     kind, phase = job["kind"], job["phase"]
     if kind is None:
         return "✅ No task is running. Send /copy or /create to start one."
@@ -382,19 +690,71 @@ def render_job():
     lines = [head]
 
     if kind == "copy":
-        total = max(job["top_id"] - job["min_id"], 1)
-        pct = 100.0 if phase == "done" else min(100.0, max(0.0, (job["cur_id"] - job["min_id"]) / total * 100))
-        lines.append(f"{job['src']} → {job['dst']}\n")
+        processed = done_count(job)
+        total_c = job.get("total_msgs") or 0
+        if total_c:
+            pct = 100.0 if phase == "done" else min(100.0, processed / total_c * 100)
+        else:
+            span = max(job["top_id"] - job["min_id"], 1)
+            pct = 100.0 if phase == "done" else min(100.0, max(0.0, (job["cur_id"] - job["min_id"]) / span * 100))
+        lines.append(f"{job['src']} → {job['dst']}")
+        if job.get("topic_total"):
+            lines.append(f"📂 Topic {job['topic_idx']}/{job['topic_total']}: {job['topic_name']}")
+        lines.append("")
         lines.append(f"{bar(pct)} {pct:.0f}%")
-        lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
+        if total_c:
+            lines.append(f"Content: {processed} / {total_c}")
+        else:
+            lines.append(f"Message ID: {job['cur_id']} / {job['top_id']}")
         lines.append(f"Copied: {job['done']} | Skipped: {job['skipped']} | Failed: {job['failed']}")
+        # live transfer progress — download (of the next file) and upload (of the current) run together
+        tc = f"/{total_c}" if total_c else ""
+        if job["ul_tot"]:
+            p = job["ul_cur"] / job["ul_tot"] * 100
+            sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
+            mode = {"fast": " ⚡fast", "normal": " (normal)", "album": " (album)"}.get(job.get("ul_mode"), "")
+            lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}{mode}: {p:.1f}% "
+                         f"({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
+        if job["dl_tot"]:
+            p = job["dl_cur"] / job["dl_tot"] * 100
+            sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
+            mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("dl_mode"), "")
+            lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}{mode}: {p:.1f}% "
+                         f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job.get("fast_note"):
+            lines.append(f"⚠️ {job['fast_note']}")
+        if job.get("paused"):
+            kind = job.get("pending_kind")
+            if kind == "topic":
+                lines.append(f"⏸ Waiting for your choice on topic: {job.get('topic_name', '')}")
+            elif kind == "start_id":
+                lines.append("⏸ Waiting for a starting message ID (or use the buttons)")
+            elif job.get("pending_id"):
+                lines.append(f"⏸ Paused — retry or skip message ID {job['pending_id']}"
+                             " (nothing skipped yet)")
+        if job["force_dl"]:
+            # download/upload mode: the per-file speed above is the real one; show total moved
+            if job["bytes_done"]:
+                lines.append(f"Total moved: {fmt_size(job['bytes_done'])}")
+        elif elapsed > 0:
+            # server-side copy: message throughput
+            lines.append(f"Speed: {job['done'] / (elapsed / 60):.0f} msg/min")
         eta = ""
         if phase == "running" and pct >= 2 and elapsed > 20:
             eta = f" | ETA: ~{fmt_duration(elapsed * (100 - pct) / pct)}"
         lines.append(f"Elapsed: {fmt_duration(elapsed)}{eta}")
+        extras = []
         if job["rules_n"]:
             scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}[job["scope"]]
-            lines.append(f"Replace rules: {job['rules_n']} ({scope})")
+            extras.append(f"word rules: {job['rules_n']} ({scope})")
+        if job["link_n"]:
+            extras.append(f"link rules: {job['link_n']}")
+        if job["has_thumb"]:
+            extras.append("custom thumbnail")
+        if job["has_footer"]:
+            extras.append("caption/promo")
+        if extras:
+            lines.append("Extras: " + ", ".join(extras))
     else:
         total = max(job["total"], 1)
         pct = 100.0 if phase == "done" else job["done"] / total * 100
@@ -403,8 +763,13 @@ def render_job():
         lines.append(f"Created: {job['done']} / {job['total']}")
         lines.append(f"Elapsed: {fmt_duration(elapsed)}")
 
-    if phase == "running" and job["flood_until"] > time.time():
-        lines.append(f"⏳ Telegram asked me to wait {int(job['flood_until'] - time.time())}s (flood wait)")
+    waits = [w for w in (job.get("flood_until") or 0, job.get("send_block_until") or 0)
+             if w > time.time()]
+    if phase == "running" and waits:
+        left = int(max(waits) - time.time()) + 1
+        lines.append(f"⏳ Flood wait: {left}s ({fmt_duration(left)}) — auto-resuming in {left}s")
+        if kind == "copy":
+            lines.append(f"   Nothing is lost; it continues right after message ID {job['cur_id']}.")
 
     if job["errors"]:
         lines.append(f"\n⚠️ Errors: {len(job['errors'])}")
@@ -418,14 +783,52 @@ def render_job():
 
 
 async def refresh(status, force=False):
+    job = S().job
     now = time.time()
-    if not force and now - job["last_edit"] < EDIT_EVERY:
+    if now < (job.get("edit_block_until") or 0.0):
+        return                      # Telegram told us to stop editing for a while
+    if not force and now - (job.get("last_edit") or 0.0) < EDIT_EVERY:
+        return
+    target = job.get("status_msg") or status
+    if target is None:
+        return
+    text = render_job()
+    # Once elapsed passes an hour it only changes every minute, so during a stalled transfer
+    # the whole text can stay identical. Editing it then returns "message was not modified",
+    # which used to be counted as a failure and answered with a brand new status message every
+    # few seconds: that froze the message being watched and eventually got sending rate-limited.
+    if text == job.get("last_text"):
         return
     job["last_edit"] = now
     try:
-        await status.edit(render_job(), parse_mode=None)
-    except Exception:
-        pass
+        await target.edit(text, parse_mode=None)
+        job["status_msg"] = target
+        job["last_text"] = text
+        job["edit_fails"] = 0
+    except FloodWaitError as e:
+        # editing one message for hours gets the whole chat rate-limited, which used to freeze
+        # the status silently (and block replies). Back off for as long as Telegram asks.
+        job["edit_block_until"] = time.time() + e.seconds + 1
+        print(f"Status edits paused for {e.seconds}s (Telegram rate limit); the copy continues.",
+              flush=True)
+    except Exception as e:
+        if type(e).__name__ == "MessageNotModifiedError" or "not modified" in str(e).lower():
+            job["last_text"] = text     # nothing to change; not a failure
+            return
+        n = job.get("edit_fails", 0) + 1
+        job["edit_fails"] = n
+        if n == 1:
+            print(f"Status update failed: {type(e).__name__}: {e}", flush=True)
+        if n >= 3:
+            # the old message really can't be edited any more: post a fresh one rather than
+            # going silent, and only once per three failures
+            try:
+                fresh = await say(text)
+                if fresh is not None:
+                    job["status_msg"] = fresh
+                job["edit_fails"] = 0
+            except Exception:
+                pass
 
 
 # ----------------------------- copy engine -----------------------------
@@ -433,26 +836,317 @@ def ent_kw(ents):
     return {"formatting_entities": ents} if ents else {"parse_mode": None}
 
 
-async def send_item(dst, msgs, rules, scope):
-    """Sends one message (or one album). Returns True if something was sent."""
-    media_msgs = [m for m in msgs
-                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
-    do_text = bool(rules) and scope in ("both", "text")
-    do_names = bool(rules) and scope in ("both", "names")
+def is_stale_ref(e):
+    """True for Telegram's 'file reference expired' error (checked by name so we don't
+    depend on the error class existing in every Telethon version)."""
+    return ("FILE_REFERENCE" in str(e).upper()
+            or type(e).__name__.startswith("FileReference"))
 
-    def caption_of(m):
-        if do_text:
-            return replace_in_text(m.raw_text or "", m.entities, rules)
-        return m.raw_text or "", list(m.entities or [])
 
-    if not media_msgs:
-        raw, ents = caption_of(msgs[0])
-        if raw.strip():
-            await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
+async def fresh_document(client, m):
+    """Re-fetches the message to get a valid file_reference. References go stale on long
+    copies because iter_messages fetched this message in a batch possibly hours ago."""
+    try:
+        fresh = await client.get_messages(m.peer_id, ids=m.id)
+        if fresh and getattr(fresh, "document", None):
+            return fresh.document
+    except Exception:
+        pass
+    return None
+
+
+def why_no_fast(enabled, fn, size):
+    """Plain reason the parallel path was skipped, so it shows up in /status."""
+    if not enabled:
+        return "disabled by env"
+    if fn is None:
+        return f"FastTelethon not loaded ({FAST_IMPORT_ERROR or 'file missing'})"
+    if size < FAST_MIN:
+        return f"file under {FAST_MIN // (1024 * 1024)} MB"
+    return "not a document"
+
+
+def is_doc(m):
+    return bool(getattr(m, "document", None))
+
+
+def is_video(m):
+    doc = getattr(m, "document", None)
+    return bool(doc) and any(isinstance(a, DocumentAttributeVideo) for a in doc.attributes)
+
+
+def doc_attrs(m, path):
+    """Original document attributes, with the filename set to the (possibly renamed) file."""
+    doc = getattr(m, "document", None)
+    attrs = []
+    for a in (doc.attributes if doc else []):
+        if isinstance(a, DocumentAttributeFilename):
+            continue
+        if isinstance(a, DocumentAttributeVideo):
+            a = copy.copy(a)
+            a.supports_streaming = True  # keep the video playable while it loads
+        attrs.append(a)
+    attrs.append(DocumentAttributeFilename(os.path.basename(path)))
+    return attrs, getattr(doc, "mime_type", None)
+
+
+def _best_thumb_size(doc):
+    """Largest real JPEG thumbnail of a document (PhotoSize or PhotoSizeProgressive)."""
+    best, best_px = None, -1
+    for t in (getattr(doc, "thumbs", None) or []):
+        if isinstance(t, (PhotoSize, PhotoSizeProgressive)):
+            px = (getattr(t, "w", 0) or 0) * (getattr(t, "h", 0) or 0)
+            if px > best_px:
+                best, best_px = t, px
+    return best
+
+
+def _save_thumb_bytes(data, dst):
+    """Writes thumbnail bytes as a Telegram-friendly JPEG (<=320px, small)."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            im.save(dst, "JPEG", quality=85)
+        return True
+    except Exception:
+        try:
+            with open(dst, "wb") as f:
+                f.write(data)
             return True
+        except Exception:
+            return False
+
+
+async def _thumb_from_video(path, dst):
+    """Grabs a frame from the video with ffmpeg (only if ffmpeg is installed on the host)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not path or not os.path.exists(path):
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-loglevel", "error", "-ss", "5", "-i", path,
+            "-frames:v", "1", "-vf", "scale=320:-2", dst,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(proc.wait(), timeout=60)
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
         return False
 
-    caps = [caption_of(m) for m in media_msgs]
+
+async def try_src_thumb(client, m, video_path=None):
+    """Gets a thumbnail for a re-uploaded video/document so it keeps its preview.
+    Downloads the source thumbnail directly (Telethon's own helper crashes on the
+    PhotoSizeProgressive format Telegram now uses), retries once with a fresh file
+    reference, and falls back to a frame from the video if ffmpeg is available."""
+    doc = getattr(m, "document", None)
+    if not doc:
+        return None
+    dst = tempfile.mktemp(suffix=".jpg", dir=DOWNLOAD_DIR)
+    reason = "source has no thumbnail"
+    for attempt in range(2):
+        size = _best_thumb_size(doc)
+        if size is None:
+            break
+        try:
+            loc = InputDocumentFileLocation(id=doc.id, access_hash=doc.access_hash,
+                                            file_reference=doc.file_reference, thumb_size=size.type)
+            data = await client.download_file(loc, bytes, dc_id=doc.dc_id)
+            if data and _save_thumb_bytes(data, dst):
+                return dst
+            reason = "empty thumbnail"
+        except FloodWaitError:
+            raise
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            if attempt == 0:
+                # the file reference may have expired during a long download: refetch the message
+                try:
+                    fresh = await client.get_messages(m.peer_id, ids=m.id)
+                    if fresh and getattr(fresh, "document", None):
+                        doc = fresh.document
+                        continue
+                except Exception:
+                    pass
+            break
+    if await _thumb_from_video(video_path, dst):
+        return dst
+    print(f"Thumbnail not copied for message {m.id}: {reason}")
+    return None
+
+
+def xfer_cb(prefix):
+    """Progress callback that updates job['dl_*'] or job['ul_*'] with live bytes and speed."""
+    job = S().job
+    st = {"t": time.time(), "b": 0}
+
+    def cb(cur, tot):
+        now = time.time()
+        job[prefix + "_cur"] = cur
+        job[prefix + "_tot"] = tot or 0
+        dt = now - st["t"]
+        if dt >= 0.5:
+            job[prefix + "_speed"] = max(0.0, cur - st["b"]) / dt
+            st["t"] = now
+            st["b"] = cur
+    return cb
+
+
+def reset_dir(prefix):
+    job = S().job
+    job[prefix + "_cur"] = 0
+    job[prefix + "_tot"] = 0
+    job[prefix + "_speed"] = 0.0
+
+
+async def wait_flood(e):
+    """Wait out a transfer flood, then carry on from the same place."""
+    job = S().job
+    job["flood_until"] = time.time() + e.seconds + 1
+    # also log it, in case Telegram is blocking our messages and /status can't be updated
+    print(f"Flood wait {e.seconds}s ({fmt_duration(e.seconds)}); auto-resuming after that "
+          f"at message ID {job.get('cur_id', 0)}.", flush=True)
+    await asyncio.sleep(e.seconds + 1)
+    job["flood_until"] = 0.0
+    print("Flood wait over, continuing.", flush=True)
+
+
+def make_captioner(opts):
+    rules, scope = opts["rules"], opts["scope"]
+    link_rules, footer = opts["link_rules"], opts["footer"]
+    do_text = bool(rules) and scope in ("both", "text")
+
+    def caption_of(m, add_foot):
+        raw = m.raw_text or ""
+        ents = list(m.entities or [])
+        if do_text:
+            raw, ents = replace_in_text(raw, ents, rules)
+        if link_rules:
+            ents = apply_link_rules(ents, link_rules)
+        if add_foot:
+            raw, ents = apply_footer(raw, ents, footer)
+        return raw, ents
+    return caption_of
+
+
+async def download_one(client, m, tmp, idx, names, dcb):
+    sub = os.path.join(tmp, str(idx))
+    os.makedirs(sub, exist_ok=True)
+    size = getattr(getattr(m, "file", None), "size", None) or 0
+    # show the download is being attempted even before the first bytes arrive
+    job = S().job
+    job["dl_tot"] = size
+    job["dl_cur"] = 0
+    if (USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN
+            and not job.get("fast_dl_off")):
+        job["dl_mode"] = "fast"
+        fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
+        path = os.path.join(sub, fname)
+        doc = m.document
+        # once one reference has gone stale, the rest of that batch is stale too, so refresh
+        # up front instead of letting every file fail its first attempt
+        if job.get("refresh_refs"):
+            doc = await fresh_document(client, m) or doc
+        for attempt in range(2):
+            try:
+                with open(path, "wb") as out:
+                    await fast_download(client, doc, out, progress_callback=dcb)
+                job["fast_note"] = ""
+                job["fast_dl_fails"] = 0      # it works, so forget earlier hiccups
+                return path
+            except FloodWaitError:
+                raise
+            except Exception as e:
+                if is_stale_ref(e):
+                    job["refresh_refs"] = True
+                if attempt == 0:
+                    newer = await fresh_document(client, m)
+                    if newer is not None:
+                        doc = newer
+                        job["dl_cur"] = 0      # restart this file's progress
+                        continue
+                note = f"fast download failed: {type(e).__name__}: {e}"
+                job["fast_note"] = note[:160]
+                print(f"Message {m.id}: {note} -> using normal (slower) download", flush=True)
+                # Some networks simply cannot open extra connections to the file's data
+                # centre. Trying anyway costs minutes per file, so after a few files in a row
+                # give up on the parallel path for this task instead of paying that each time.
+                job["fast_dl_fails"] = job.get("fast_dl_fails", 0) + 1
+                if job["fast_dl_fails"] >= FAST_DL_GIVE_UP:
+                    job["fast_dl_off"] = True
+                    job["fast_note"] = ("parallel download isn't working here; "
+                                        "using normal download for the rest of this task")
+                    print(f"Parallel download failed on {job['fast_dl_fails']} files in a row; "
+                          "switching to normal download for the rest of this task.", flush=True)
+                break
+    else:
+        job["fast_note"] = f"fast download off: {why_no_fast(USE_FAST_DL, fast_download, size)}"
+    job["dl_mode"] = "normal"
+    if m.id in names:
+        return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
+    return await m.download_media(file=sub + os.sep, progress_callback=dcb)
+
+
+async def with_stall_guard(coro, prefix):
+    """Runs a transfer coroutine, but aborts it if it makes no progress for STALL_SECONDS
+    (a silently dead connection), so the copy never freezes forever on one file."""
+    job = S().job
+    task = asyncio.ensure_future(coro)
+    last_cur, last_change = -1, time.time()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if task in done:
+                return task.result()
+            if job["flood_until"] > time.time():
+                last_change = time.time()        # waiting on Telegram, not a stall
+                continue
+            cur = job.get(prefix + "_cur", 0) or 0
+            if cur != last_cur:
+                last_cur, last_change = cur, time.time()
+            elif time.time() - last_change > STALL_SECONDS:
+                raise TimeoutError(f"no progress for {STALL_SECONDS}s (dead connection)")
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+
+
+async def run_transfer(make_coro, prefix, attempts=RETRY_ATTEMPTS):
+    """Runs a transfer with the stall guard, retrying a few times if it stalls."""
+    last = None
+    for _ in range(attempts):
+        try:
+            return await with_stall_guard(make_coro(), prefix)
+        except FloodWaitError:
+            raise
+        except TimeoutError as e:
+            last = e
+            reset_dir(prefix)
+            await asyncio.sleep(2)
+    raise last
+
+
+async def prepare_group(group, opts):
+    """Downloads whatever must be re-uploaded (nothing for a direct server-side copy).
+    Runs ahead of sending so the next file downloads while the current one uploads."""
+    client = S().client
+    job = S().job
+    rules, scope, thumb = opts["rules"], opts["scope"], opts["thumb"]
+    do_names = bool(rules) and scope in ("both", "names")
+    caption_of = make_captioner(opts)
+    media_msgs = [m for m in group
+                  if m.media and not isinstance(m.media, (MessageMediaWebPage, MessageMediaPoll))]
+
+    if not media_msgs:
+        return {"media_msgs": [], "caps": [caption_of(group[0], True)], "files": None,
+                "names": {}, "reupload": set(), "tmp": None, "text_only": True}
+
+    caps = [caption_of(m, i == 0) for i, m in enumerate(media_msgs)]
     names = {}
     if do_names:
         for m in media_msgs:
@@ -461,119 +1155,585 @@ async def send_item(dst, msgs, rules, scope):
                 new = rename_file(old, rules)
                 if new != old:
                     names[m.id] = new
-
-    async def upload(files, streaming):
-        extra = {"supports_streaming": True} if streaming else {}
-        if len(files) == 1:
-            raw, ents = caps[0]
-            await client.send_file(dst, files[0], caption=raw, **ent_kw(ents), **extra)
-        else:
-            any_ents = any(e for _, e in caps)
-            if any_ents:
-                cap_list = [tl_markdown.unparse(r, e) if e else r for r, e in caps]
-                kw = {}
-            else:
-                cap_list = [r for r, _ in caps]
-                kw = {"parse_mode": None}
-            await client.send_file(dst, files, caption=cap_list, **kw, **extra)
+    if job.get("force_dl"):
+        reupload = {m.id for m in media_msgs}
+    else:
+        reupload = {m.id for m in media_msgs if m.id in names or (thumb and is_doc(m))}
 
     tmp = None
-
-    async def download(i, m, rename):
-        nonlocal tmp
-        if tmp is None:
-            tmp = tempfile.mkdtemp(prefix="cp_")
-        sub = os.path.join(tmp, str(i))
-        os.makedirs(sub, exist_ok=True)
-        if rename and m.id in names:
-            return await m.download_media(file=os.path.join(sub, names[m.id]))
-        return await m.download_media(file=sub + os.sep)
-
-    try:
+    if reupload:
+        dcb = xfer_cb("dl")
         try:
-            files = []
-            for i, m in enumerate(media_msgs):
-                files.append(await download(i, m, True) if m.id in names else m.media)
-            await upload(files, streaming=bool(names))
-            return True
-        except FloodWaitError:
+            while True:
+                try:
+                    tmp = tmp or tempfile.mkdtemp(prefix="cp_", dir=DOWNLOAD_DIR)
+                    files = []
+                    for i, m in enumerate(media_msgs):
+                        if m.id in reupload:
+                            files.append(await run_transfer(
+                                lambda mm=m, ii=i: download_one(client, mm, tmp, ii, names, dcb), "dl"))
+                        else:
+                            files.append(m.media)
+                    break
+                except FloodWaitError as e:
+                    await wait_flood(e)
+        except BaseException:
+            # a failed/cancelled download must not leave a partial file behind on disk
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
             raise
-        except Exception:
-            pass  # fall back to a full download and re-upload
-        files = [await download(i, m, True) for i, m in enumerate(media_msgs)]
-        await upload(files, streaming=True)
-        return True
-    finally:
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            reset_dir("dl")
+    else:
+        files = [m.media for m in media_msgs]
+    return {"media_msgs": media_msgs, "caps": caps, "files": files,
+            "names": names, "reupload": reupload, "tmp": tmp, "text_only": False}
 
 
-async def safe_send(dst, group, rules, scope):
-    """Returns (sent: bool, error: Exception or None). Waits out FloodWait automatically."""
-    while True:
+async def do_upload(client, dst, prepared, opts):
+    media_msgs, caps, files = prepared["media_msgs"], prepared["caps"], prepared["files"]
+    thumb = opts["thumb"]
+    job = S().job
+    ucb = xfer_cb("ul")
+    if len(files) == 1:
+        raw, ents = caps[0]
+        m0, f0 = media_msgs[0], files[0]
+        own_thumb = None
+        thumb_file = None
+        if is_doc(m0) and isinstance(f0, str):
+            if thumb:
+                thumb_file = thumb
+            else:
+                own_thumb = await try_src_thumb(client, m0, f0)
+                thumb_file = own_thumb
+        thumb_kw = {"thumb": thumb_file} if thumb_file else {}
         try:
-            return await send_item(dst, group, rules, scope), None
-        except FloodWaitError as e:
-            job["flood_until"] = time.time() + e.seconds + 1
-            await asyncio.sleep(e.seconds + 1)
-            job["flood_until"] = 0.0
-        except Exception as e:
-            return False, e
+            if (USE_FAST and fast_upload is not None and isinstance(f0, str)
+                    and is_doc(m0) and os.path.getsize(f0) >= FAST_MIN):
+                job["ul_mode"] = "fast"
+                try:
+                    with open(f0, "rb") as fh:
+                        input_file = await fast_upload(client, fh, progress_callback=ucb)
+                    attrs, mime = doc_attrs(m0, f0)
+                    await client.send_file(dst, input_file, caption=raw, attributes=attrs,
+                                           mime_type=mime, **ent_kw(ents), **thumb_kw)
+                    job["fast_note"] = ""
+                    return
+                except FloodWaitError:
+                    raise
+                except Exception as e:
+                    # fall back to the normal single-connection upload, and say so
+                    note = f"fast upload failed: {type(e).__name__}: {e}"
+                    job["fast_note"] = note[:160]
+                    print(f"Message {m0.id}: {note} -> using normal (slower) upload", flush=True)
+            elif isinstance(f0, str) and is_doc(m0):
+                size0 = os.path.getsize(f0)
+                job["fast_note"] = f"fast upload off: {why_no_fast(USE_FAST, fast_upload, size0)}"
+                print(f"Message {m0.id}: {job['fast_note']}", flush=True)
+            job["ul_mode"] = "normal"
+            extra = {"supports_streaming": True} if isinstance(f0, str) else {}
+            await client.send_file(dst, f0, caption=raw, progress_callback=ucb,
+                                   **ent_kw(ents), **thumb_kw, **extra)
+        finally:
+            if own_thumb and os.path.exists(own_thumb):
+                try:
+                    os.remove(own_thumb)
+                except Exception:
+                    pass
+    else:
+        job["ul_mode"] = "album"   # albums go through Telethon's normal upload
+        streaming = any(isinstance(f, str) for f in files)
+        extra = {"supports_streaming": True} if streaming else {}
+        any_ents = any(e for _, e in caps)
+        if any_ents:
+            cap_list = [tl_markdown.unparse(r, e) if e else r for r, e in caps]
+            kw = {}
+        else:
+            cap_list = [r for r, _ in caps]
+            kw = {"parse_mode": None}
+        await client.send_file(dst, files, caption=cap_list, progress_callback=ucb, **kw, **extra)
 
 
-async def run_copy(src_ref, dst_ref, min_id, rules, scope):
-    job.update(running=True, stop=False, kind="copy", phase="running", started=time.time(),
-               last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, cur_id=min_id,
-               min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
-               rules_n=len(rules.pairs) if rules else 0, scope=scope)
-    status = None
+async def send_group(dst, group, prepared, opts):
+    """Uploads/sends an already-prepared group. Returns (sent, error, extra_tmp_to_clean)."""
+    client = S().client
+    job = S().job
+    extra_tmp = None
     try:
-        src = await resolve(src_ref, "Source channel")
-        dst = await resolve(dst_ref, "Destination channel")
-        job.update(src=title_of(src), dst=title_of(dst), key=f"{src.id}->{dst.id}")
-        latest = await client.get_messages(src, limit=1)
-        job["top_id"] = max(latest[0].id if latest else min_id, min_id)
-        status = await say("▶️ Copy started…")
-        await refresh(status, force=True)
+        if prepared["text_only"]:
+            raw, ents = prepared["caps"][0]
+            if not raw.strip():
+                return False, None, None
+            while True:
+                try:
+                    await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
+                    return True, None, None
+                except FloodWaitError as e:
+                    await wait_flood(e)
+        while True:
+            try:
+                await run_transfer(lambda: do_upload(client, dst, prepared, opts), "ul")
+                return True, None, extra_tmp
+            except FloodWaitError as e:
+                await wait_flood(e)
+            except Exception as e:
+                # direct server-side copy failed (restricted source): download + re-upload once
+                if not prepared["reupload"] and not job.get("force_dl"):
+                    job["force_dl"] = True
+                    try:
+                        prepared = await prepare_group(group, opts)
+                        extra_tmp = prepared.get("tmp")
+                        continue
+                    except Exception as e2:
+                        return False, e2, extra_tmp
+                return False, e, extra_tmp
+    finally:
+        reset_dir("ul")
 
+
+async def list_topics(client, ent):
+    """Topics of a forum group, bottom of the list first (the order you see them from the
+    bottom in Telegram). Returns None when the source is a plain channel, so those copy
+    exactly as before."""
+    if not getattr(ent, "forum", False) or GetForumTopicsRequest is None:
+        return None
+    found, seen = [], set()
+    offset_date, offset_id, offset_topic = 0, 0, 0
+    while True:
+        res = await client(forum_topics_request(
+            ent, offset_date=offset_date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=100))
+        raw = getattr(res, "topics", None) or []
+        if not raw:
+            break
+        for t in raw:
+            # deleted topics carry no title; skip them but still count them for paging
+            if getattr(t, "title", None) and t.id not in seen:
+                seen.add(t.id)
+                found.append(t)
+        if len(raw) < 100:
+            break
+        last = raw[-1]
+        if last.id == offset_topic:       # no progress, stop instead of looping forever
+            break
+        offset_topic = last.id
+        offset_id = getattr(last, "top_message", 0) or 0
+        dates = {m.id: m.date for m in (getattr(res, "messages", None) or [])
+                 if getattr(m, "id", None)}
+        offset_date = dates.get(offset_id) or offset_date
+    found.reverse()        # Telegram lists most recent activity first; we want bottom upwards
+    return [(t.id, t.title) for t in found]
+
+
+async def ask_topic_start(name, seg_key):
+    """Ask where to start inside a topic. Returns an int message id, or begin / resume / stop.
+    If this topic was interrupted before, its own stopping point is offered."""
+    job = S().job
+    last_id, already = progress_entry(seg_key)
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["pending_kind"] = "start_id"
+    job["paused"] = True
+    rows = [[Button.inline("⏮ Start from the beginning", b"st:begin")]]
+    if last_id:
+        rows.append([Button.inline(f"⏯ Resume after message ID {last_id}", b"st:resume")])
+    rows.append([Button.inline("🛑 Stop the copy", b"st:stop")])
+    seen = (f"\n\nLast time this topic stopped after message ID {last_id}"
+            f" ({already} copied)." if last_id else "")
+    try:
+        await say(f"📍 Starting point for topic: {name}\n\n"
+                  "Send a message ID to start from, or use a button below." + seen,
+                  critical=True, buttons=rows)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["pending_kind"] = ""
+        job["paused"] = False
+
+
+async def ask_topic(name, idx, total):
+    """Pause before a topic and ask whether to copy it. Returns copy / skip / stop."""
+    job = S().job
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["pending_kind"] = "topic"
+    job["paused"] = True
+    try:
+        await say(f"📂 Topic {idx} of {total}: {name}\n\n"
+                  "Copy this topic? Its title goes to the destination first, then its content.",
+                  critical=True,
+                  buttons=[[Button.inline("✅ Copy this topic", b"tp:copy")],
+                           [Button.inline("⏭ Skip this topic", b"tp:skip")],
+                           [Button.inline("🛑 Stop the copy", b"tp:stop")]])
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["pending_kind"] = ""
+        job["paused"] = False
+
+
+def done_count(job):
+    """Items finished including ones copied before a resume, so the count and the
+    percentage keep going up across resumes instead of restarting at zero."""
+    return job.get("base_done", 0) + job["done"] + job["skipped"] + job["failed"]
+
+
+def group_bytes(group):
+    return sum((getattr(getattr(m, "file", None), "size", None) or 0) for m in group)
+
+
+def clean_tmp(prepared):
+    t = prepared.get("tmp") if isinstance(prepared, dict) else None
+    if t:
+        shutil.rmtree(t, ignore_errors=True)
+
+
+async def _send_prepared(dst, group, prepared, opts):
+    """Send an already-downloaded group. Returns (status, bytes, error)."""
+    try:
+        sent, err, extra_tmp = await send_group(dst, group, prepared, opts)
+    except Exception as e:
+        clean_tmp(prepared)
+        return "fail", 0, e
+    clean_tmp(prepared)
+    if extra_tmp:
+        shutil.rmtree(extra_tmp, ignore_errors=True)
+    if err is not None:
+        return "fail", 0, err
+    if sent:
+        return "done", group_bytes(group), None
+    return "skip", 0, None
+
+
+async def _download_and_send(dst, group, opts):
+    """Download then send a group. Returns (status, bytes, error)."""
+    try:
+        prepared = await prepare_group(group, opts)
+    except Exception as e:
+        return "fail", 0, e
+    if isinstance(prepared, dict) and "__error__" in prepared:
+        return "fail", 0, prepared["__error__"]
+    return await _send_prepared(dst, group, prepared, opts)
+
+
+async def ask_retry(last_id, err):
+    """Pause the copy and ask the user: retry / skip / stop. Returns the chosen string."""
+    sess = S()
+    job = sess.job
+    fut = asyncio.get_event_loop().create_future()
+    job["pending"] = fut
+    job["pending_kind"] = "retry"
+    job["pending_id"] = last_id
+    job["paused"] = True
+    name = type(err).__name__ if err else "error"
+    detail = (str(err) or name).replace("\n", " ")[:160] if err else ""
+    try:
+        await say(f"⚠️ Couldn't copy message ID {last_id} after {RETRY_ATTEMPTS} automatic tries.\n"
+                  f"{name}: {detail}\n\n"
+                  "Nothing has been skipped. What should I do?",
+                  buttons=[[Button.inline("🔁 Retry this file", b"job:retry")],
+                           [Button.inline("⏭ Skip this file", b"job:skip")],
+                           [Button.inline("🛑 Stop the copy", b"job:stop")]])
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            return "stop"
+    finally:
+        job["pending"] = None
+        job["paused"] = False
+
+
+async def process_with_retry(dst, group, opts, prepared=None):
+    """Copy one group. On any failure, pause and ask the user (retry / skip / stop).
+    Nothing is ever skipped without the user choosing to."""
+    job = S().job
+    last_id = group[-1].id
+    while True:
+        if prepared is not None:
+            status, nbytes, err = await _send_prepared(dst, group, prepared, opts)
+            prepared = None                 # consumed; any retry re-downloads from scratch
+        else:
+            status, nbytes, err = await _download_and_send(dst, group, opts)
+        if status == "done":
+            job["done"] += len(group)
+            job["bytes_done"] += nbytes
+            return
+        if status == "skip":
+            job["skipped"] += len(group)
+            return
+        # failure — record it and ask the user (no automatic skipping)
+        record_error(f"message ID {last_id}", err)
+        if job["stop"]:
+            job["failed"] += len(group)
+            return
+        decision = await ask_retry(last_id, err)
+        if decision == "skip":
+            job["failed"] += len(group)
+            return
+        if decision == "stop":
+            job["stop"] = True
+            job["failed"] += len(group)
+            return
+        # decision == "retry": loop and try again
+
+
+async def copy_messages(client, src, dst, opts, topic_id, start_id, status):
+    """Copies a whole channel, or one topic of a forum group when topic_id is given.
+    reply_to limits iteration to that topic; everything else works exactly as before."""
+    job = S().job
+    it_kw = {"reply_to": topic_id} if topic_id else {}
+
+    if PIPELINE:
+        # overlap: a producer downloads the next group while the consumer uploads the current one
+        queue = asyncio.Queue(maxsize=1)
+        STOP = object()
+
+        async def producer():
+            group = []
+            enq = [0]
+
+            async def enqueue(g):
+                job["dl_no"] = job.get("base_done", 0) + enq[0] + 1
+                enq[0] += len(g)
+                try:
+                    prepared = await prepare_group(g, opts)
+                except Exception as e:
+                    prepared = {"__error__": e, "tmp": None}
+                await queue.put((g, prepared))
+
+            try:
+                async for m in client.iter_messages(src, reverse=True, min_id=start_id, **it_kw):
+                    if job["stop"]:
+                        break
+                    if m.action:
+                        continue
+                    if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                        group.append(m)
+                        continue
+                    if group:
+                        await enqueue(group)
+                    group = [m]
+                if group and not job["stop"]:
+                    await enqueue(group)
+            finally:
+                await queue.put(STOP)
+
+        prod = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is STOP:
+                    break
+                group, prepared = item
+                last_id = group[-1].id
+                job["ul_no"] = done_count(job) + 1
+                arg = None if (isinstance(prepared, dict) and "__error__" in prepared) else prepared
+                await process_with_retry(dst, group, opts, prepared=arg)
+                job["cur_id"] = last_id
+                save_progress(job["key"], last_id, done_count(job))
+                if job["stop"]:
+                    break
+                try:
+                    await asyncio.sleep(job["delay"])
+                    await refresh(status)
+                except Exception:
+                    pass
+        finally:
+            prod.cancel()
+            try:
+                await prod
+            except BaseException:
+                pass
+            while not queue.empty():
+                try:
+                    it = queue.get_nowait()
+                except Exception:
+                    break
+                if isinstance(it, tuple):
+                    clean_tmp(it[1])
+    else:
+        # sequential: download a group fully, then upload it (one transfer at a time)
         group = []
 
         async def flush():
             nonlocal group
             if not group:
                 return
-            sent, err = await safe_send(dst, group, rules, scope)
-            last_id = group[-1].id
-            if err is not None:
-                job["failed"] += len(group)
-                record_error(f"message ID {last_id}", err)
-            elif sent:
-                job["done"] += len(group)
-            else:
-                job["skipped"] += len(group)
+            g, group = group, []
+            last_id = g[-1].id
+            job["dl_no"] = job["ul_no"] = done_count(job) + 1
+            await process_with_retry(dst, g, opts)
             job["cur_id"] = last_id
-            save_progress(job["key"], last_id)
-            group = []
-            await asyncio.sleep(DELAY)
-            await refresh(status)
+            save_progress(job["key"], last_id, done_count(job))
+            try:
+                await asyncio.sleep(job["delay"])
+                await refresh(status)
+            except Exception:
+                pass
 
-        async for m in client.iter_messages(src, reverse=True, min_id=min_id):
+        async for m in client.iter_messages(src, reverse=True, min_id=start_id, **it_kw):
             if job["stop"]:
                 break
             if m.action:
                 continue
-            if m.grouped_id:
-                if group and group[0].grouped_id == m.grouped_id:
-                    group.append(m)
-                    continue
-                await flush()
-                group = [m]
-            else:
-                await flush()
-                group = [m]
-                await flush()
-        if not job["stop"]:
+            if m.grouped_id and group and group[0].grouped_id == m.grouped_id:
+                group.append(m)
+                continue
             await flush()
+            group = [m]
+        if group and not job["stop"]:
+            await flush()
+
+
+async def copy_topics(client, src, dst, opts, topics, status, min_id):
+    """Walks a forum group's topics one at a time, asking before each one. Each topic keeps
+    its own progress, so the counter shows that topic's messages, not the whole group's."""
+    job = S().job
+    total_t = len(topics)
+    job["topic_total"] = total_t
+    pair = f"{src.id}->{dst.id}"
+
+    # the first topic and its starting point were chosen during the /copy steps
+    first_tid = opts.get("topic_id")
+    start_at = 0
+    for k, (tid, _name) in enumerate(topics):
+        if tid == (first_tid if first_tid else get_setting(f"last_topic:{pair}")):
+            start_at = k
+            break
+    await say(f"📂 {job['src']} is a topic group with {total_t} topic(s).\n"
+              f"Starting at topic {start_at + 1}: {topics[start_at][1]}. "
+              "I'll ask about the next ones as we go.")
+
+    for k in range(start_at, total_t):
+        tid, name = topics[k]
+        if job["stop"]:
+            break
+        job.update(topic_idx=k + 1, topic_name=name)
+
+        if k == start_at and first_tid == tid:
+            start_id, base = min_id, opts.get("base_done") or 0
+        else:
+            choice = await ask_topic(name, k + 1, total_t)
+            if choice == "stop":
+                job["stop"] = True
+                break
+            if choice == "skip":
+                await say(f"⏭ Skipped topic: {name}")
+                continue
+            where = await ask_topic_start(name, f"{pair}#{tid}")
+            if where == "stop":
+                job["stop"] = True
+                break
+            last_id, already = progress_entry(f"{pair}#{tid}")
+            if isinstance(where, int):
+                start_id, base = max(0, where - 1), 0   # start from the id you sent
+            elif where == "resume":
+                start_id, base = last_id, already
+            else:
+                start_id, base = 0, 0
+
+        seg_key = f"{pair}#{tid}"
+        # remember where we are, so a later resume comes back to this topic
+        set_setting(f"last_topic:{pair}", tid)
+        try:
+            total_m = getattr(await client.get_messages(src, limit=0, reply_to=tid), "total", 0) or 0
+        except Exception:
+            total_m = 0
+        top = start_id
+        try:
+            latest = await client.get_messages(src, limit=1, reply_to=tid)
+            if latest:
+                top = max(latest[0].id, start_id)
+        except Exception:
+            pass
+        # this topic's own counters, so /status reads like "2 / 3" inside the topic
+        job.update(key=seg_key, base_done=base, done=0, skipped=0,
+                   failed=0, total_msgs=total_m, cur_id=start_id, min_id=start_id, top_id=top)
+
+        if not start_id:
+            # the title goes to the destination before the topic's content
+            try:
+                await client.send_message(dst, name, parse_mode=None, link_preview=False)
+            except Exception as e:
+                record_error(f"topic title '{name}'", e)
+
+        await copy_messages(client, src, dst, opts, tid, start_id, status)
+        if not job["stop"]:
+            if k + 1 < total_t:
+                # finished cleanly, so a later resume should offer the next topic
+                set_setting(f"last_topic:{pair}", topics[k + 1][0])
+            await say(f"✅ Topic done: {name} — copied {job['done']}, "
+                      f"skipped {job['skipped']}, failed {job['failed']}.")
+
+
+async def run_copy(src_ref, dst_ref, min_id, opts):
+    sess = S()
+    client = sess.client
+    job = sess.job
+    rules = opts["rules"]
+    job.update(running=True, stop=False, kind="copy", phase="running", started=time.time(),
+               last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
+               cur_id=min_id, min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
+               rules_n=len(rules.pairs) if rules else 0, scope=opts["scope"],
+               link_n=len(opts["link_rules"].pairs) if opts["link_rules"] else 0,
+               has_thumb=bool(opts["thumb"]), has_footer=bool(opts["footer"]),
+               delay=get_delay(), base_done=opts.get("base_done") or 0)
+    status = None
+    ticker_task = None
+
+    async def progress_ticker():
+        # keeps /status live. Only force an edit during a flood countdown; otherwise respect
+        # EDIT_EVERY so we don't edit the message so often that Telegram rate-limits the bot
+        # (which made it respond to other commands late).
+        tick = max(1.0, EDIT_EVERY / 2)   # so EDIT_EVERY alone controls how often /status refreshes
+        try:
+            while job["running"]:
+                # one bad update must never kill this task: that left the live status frozen
+                # for the rest of the copy while the transfer carried on
+                try:
+                    force = (job.get("flood_until") or 0) > time.time()
+                    await refresh(status, force=force)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"Status update problem: {type(e).__name__}: {e}", flush=True)
+                await asyncio.sleep(tick)
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        src = await resolve(src_ref, "Source channel")
+        dst = await resolve(dst_ref, "Destination channel")
+        job.update(src=title_of(src), dst=title_of(dst), key=f"{src.id}->{dst.id}")
+        # protected/private source: skip the pointless direct-copy attempt, download+upload directly
+        if getattr(src, "noforwards", False):
+            job["force_dl"] = True
+        status = await say("▶️ Copy started…")
+        await refresh(status, force=True)
+        ticker_task = asyncio.create_task(progress_ticker())
+
+        topics = None
+        try:
+            topics = await list_topics(client, src)
+        except Exception as e:
+            record_error("reading topics", e)      # fall back to copying it as a plain channel
+
+        if topics:
+            await copy_topics(client, src, dst, opts, topics, status, min_id)
+        else:
+            try:
+                job["total_msgs"] = getattr(await client.get_messages(src, limit=0), "total", 0) or 0
+            except Exception:
+                job["total_msgs"] = 0
+            latest = await client.get_messages(src, limit=1)
+            job["top_id"] = max(latest[0].id if latest else min_id, min_id)
+            await copy_messages(client, src, dst, opts, None, min_id, status)
         job["phase"] = "stopped" if job["stop"] else "done"
     except BadInput as e:
         job["phase"] = "error"
@@ -589,10 +1749,15 @@ async def run_copy(src_ref, dst_ref, min_id, rules, scope):
     finally:
         job["running"] = False
         job["flood_until"] = 0.0
+        job["dl_tot"] = job["dl_cur"] = job["ul_tot"] = job["ul_cur"] = 0
+        job["dl_speed"] = job["ul_speed"] = 0.0
+        if ticker_task is not None:
+            ticker_task.cancel()
         job["last_result"] = render_job()
         if status is not None:
             await refresh(status, force=True)
-            if job["phase"] == "done" and job["done"] == 0 and job["failed"] == 0 and job["skipped"] == 0:
+            if (job["phase"] == "done" and not job.get("topic_total")
+                    and job["done"] == 0 and job["failed"] == 0 and job["skipped"] == 0):
                 await say(f"ℹ️ There was nothing new to copy after message ID {min_id}.\n"
                           "To copy from the very beginning, run /copy again and choose 'From the beginning'.")
             else:
@@ -602,8 +1767,12 @@ async def run_copy(src_ref, dst_ref, min_id, rules, scope):
 
 # ----------------------------- create engine -----------------------------
 async def run_create(name, count):
+    sess = S()
+    client = sess.client
+    job = sess.job
     job.update(running=True, stop=False, kind="create", phase="running", started=time.time(),
-               last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0, rules_n=0)
+               last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0,
+               rules_n=0, link_n=0, has_thumb=False, has_footer=False)
     status = await say("▶️ Channel creation started…")
     await refresh(status, force=True)
     try:
@@ -641,120 +1810,415 @@ async def run_create(name, count):
         await say("🔔 Task finished. Send /status for details.")
 
 
+def build_opts(conv):
+    rules = Rules(conv["rules"]) if conv["rules"] else None
+    link_rules = Rules(conv["link_rules"]) if conv["link_rules"] else None
+    footer = None
+    if conv["footer_text"]:
+        ftext, fents = tl_markdown.parse(conv["footer_text"])
+        footer = (ftext, fents, conv["footer_pos"])
+    return {"rules": rules, "scope": conv["scope"] or "both", "link_rules": link_rules,
+            "thumb": conv["thumb"], "footer": footer,
+            "base_done": conv.get("base_done") or 0,
+            "resume": bool(conv.get("resume")),
+            "topic_id": conv.get("topic_id")}
+
+
+async def _run_in_session(sess, coro):
+    # the background job runs in its own task; set the session here so S() always works
+    _cur.set(sess)
+    await coro
+
+
 def start_copy_job():
-    pairs = conv["rules"] or []
-    rules = Rules(pairs) if pairs else None
-    scope = conv["scope"] or "both"
-    args = (conv["src"], conv["dst"], conv["start"], rules, scope)
+    sess = S()
+    conv = sess.conv
+    opts = build_opts(conv)
+    args = (conv["src"], conv["dst"], conv["start"], opts)
     set_setting("last_src", {"ref": conv["src"], "title": conv["src_title"]})
     set_setting("last_dst", {"ref": conv["dst"], "title": conv["dst_title"]})
-    reset_conv()
-    job["running"] = True
-    asyncio.create_task(run_copy(*args))
+    sess.reset_conv()
+    sess.job["running"] = True
+    asyncio.create_task(_run_in_session(sess, run_copy(*args)))
 
 
 def start_create_job():
-    name, count = conv["name"], conv["count"]
-    reset_conv()
-    job["running"] = True
-    asyncio.create_task(run_create(name, count))
+    sess = S()
+    name, count = sess.conv["name"], sess.conv["count"]
+    sess.reset_conv()
+    sess.job["running"] = True
+    asyncio.create_task(_run_in_session(sess, run_create(name, count)))
 
 
-# ----------------------------- guided flows -----------------------------
+# ----------------------------- guided copy flow -----------------------------
+PICK_PAGE = 6
+
+
+async def list_channels(admin_only):
+    """Returns [(ref_id, title), ...] of the user's channels (cached ~2 min)."""
+    sess = S()
+    key = "admin" if admin_only else "all"
+    now = time.time()
+    cached = sess.chan_cache.get(key)
+    if cached and now - cached[0] < 120:
+        return cached[1]
+    out = []
+    try:
+        async for d in sess.client.iter_dialogs():
+            ent = d.entity
+            if isinstance(ent, Channel):
+                if admin_only and not (getattr(ent, "creator", False) or getattr(ent, "admin_rights", None)):
+                    continue
+                out.append((int("-100" + str(ent.id)), title_of(ent)))
+                if len(out) >= 1000:
+                    break
+        sess.dialogs_loaded = True
+    except Exception:
+        pass
+    sess.chan_cache[key] = (now, out)
+    return out
+
+
+def pick_rows(kind, items, page):
+    start = page * PICK_PAGE
+    rows = [[Button.inline(f"📢 {t[:40]}", f"pk:{kind}:{start + i}".encode())]
+            for i, (cid, t) in enumerate(items[start:start + PICK_PAGE])]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ Prev", f"pg:{kind}:{page - 1}".encode()))
+    if start + PICK_PAGE < len(items):
+        nav.append(Button.inline("Next ▶️", f"pg:{kind}:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    return rows
+
+
+def build_pick(kind, header):
+    conv = S().conv
+    items = conv.get(f"pick_{kind}") or []
+    page = conv.get(f"pick_{kind}_page", 0)
+    last = get_setting("last_src" if kind == "src" else "last_dst")
+    rows = []
+    if last:
+        rows.append([Button.inline(f"♻️ Last: {last['title'][:28]}",
+                                   b"src:last" if kind == "src" else b"dst:last")])
+    rows += pick_rows(kind, items, page)
+    rows.append([Button.inline("✖️ Cancel", b"cancel")])
+    if items:
+        tp = (len(items) + PICK_PAGE - 1) // PICK_PAGE
+        tail = (f"\n\n👇 Tap a channel (page {page + 1}/{tp}). "
+                "Lots of channels? Just type part of the name to search. "
+                "You can also send a channel ID (-100…), an @username, or forward a message.")
+    else:
+        tail = ("\n\nType part of a channel's name to search, or send a channel ID (-100…) "
+                "or @username, or forward a message from it.")
+    return header + tail, rows
+
+
+def src_header():
+    return ("📥 Step 1 of 4 — Source channel (copy FROM)\n\n"
+            "This can be someone else's channel — it does NOT have to be yours.\n"
+            "• Pick a channel you've joined from the buttons below, or\n"
+            "• Send a channel ID (private channels look like -1001234567890), or\n"
+            "• For a public channel, send its @username or t.me link, or\n"
+            "• Forward any message from the channel to me.")
+
+
+def dst_header():
+    return (f"✅ Source: {S().conv['src_title']}\n\n"
+            "📤 Step 2 of 4 — Destination channel (copy TO)\n\n"
+            "This must be YOUR channel (your account is an admin).\n"
+            "Pick one below, or send its ID / @username, or forward a message from it.")
+
+
 async def ask_src():
+    conv = S().conv
     conv["step"] = "src"
-    last = get_setting("last_src")
-    buttons = [[Button.inline(f"Use last source: {last['title'][:35]}", b"src:last")]] if last else None
-    await say("📥 Step 1 of 4 — Source channel\n\n"
-              "Send the ID or @username of the channel to copy FROM.\n"
-              "• Private channel IDs start with -100 (for example -1001234567890).\n"
-              "• Or forward any message from that channel to me.\n\n"
-              "Send /stop to cancel.", buttons=buttons)
+    items = await list_channels(admin_only=False)
+    conv["pick_src_all"] = items
+    conv["pick_src"] = items
+    conv["pick_src_page"] = 0
+    text, rows = build_pick("src", src_header())
+    await say(text, buttons=rows)
 
 
 async def ask_dst():
+    conv = S().conv
     conv["step"] = "dst"
-    last = get_setting("last_dst")
-    buttons = [[Button.inline(f"Use last destination: {last['title'][:30]}", b"dst:last")]] if last else None
-    await say(f"✅ Source: {conv['src_title']}\n\n"
-              "📤 Step 2 of 4 — Destination channel\n\n"
-              "Send the ID or @username of the channel to copy TO, or forward any message from it.\n"
-              "Your account must be an admin there.", buttons=buttons)
+    items = await list_channels(admin_only=True)
+    conv["pick_dst_all"] = items
+    conv["pick_dst"] = items
+    conv["pick_dst_page"] = 0
+    text, rows = build_pick("dst", dst_header())
+    await say(text, buttons=rows)
+
+
+async def handle_channel_text(kind, text, fwd):
+    """Handles typed input at the source/destination step: forward, @username/ID, or a search query."""
+    conv = S().conv
+    label = "Source" if kind == "src" else "Destination"
+    setfn = set_src if kind == "src" else set_dst
+    if fwd:
+        if await setfn(fwd):
+            await copy_next()
+        return
+    tokens = text.split()
+    ref = None
+    if len(tokens) == 1:
+        tok = tokens[0]
+        try:
+            ref = check_ref(tok, label)
+        except BadInput as e:
+            # if it clearly looks like an ID/username attempt, show the hint instead of searching
+            if re.match(r"^(@|-|\d|https?://|t\.me)", tok):
+                await say(f"❌ {e}\n\nYou can also type part of the channel's name to search for it.")
+                return
+            ref = None
+    if ref is not None:
+        if await setfn(ref):
+            await copy_next()
+        return
+    # treat the text as a search over the user's channels
+    q = text.strip().lower()
+    all_items = conv.get(f"pick_{kind}_all") or []
+    matches = [it for it in all_items if q in it[1].lower()] if q else all_items
+    conv[f"pick_{kind}"] = matches
+    conv[f"pick_{kind}_page"] = 0
+    base = src_header() if kind == "src" else dst_header()
+    if matches:
+        header = base + f"\n\n🔍 {len(matches)} match(es) for “{text.strip()}”:"
+        txt, rows = build_pick(kind, header)
+        await say(txt, buttons=rows)
+    else:
+        await say(f"🔍 No channels matching “{text.strip()}”.\n"
+                  "Try fewer letters, or send the @username / ID, or forward a message from the channel.")
+
+
+def progress_key_for(conv):
+    """Progress is kept per topic for forum groups, and per channel otherwise."""
+    pair = f"{conv['src_id']}->{conv['dst_id']}"
+    return f"{pair}#{conv['topic_id']}" if conv.get("topic_id") else pair
+
+
+TOPIC_PAGE = 8
+
+
+def topic_rows(conv, page):
+    items = conv.get("topics") or []
+    start = page * TOPIC_PAGE
+    rows = [[Button.inline(f"📂 {name[:40]}", f"tpk:{start + i}".encode())]
+            for i, (_tid, name) in enumerate(items[start:start + TOPIC_PAGE])]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ Prev", f"tpg:{page - 1}".encode()))
+    if start + TOPIC_PAGE < len(items):
+        nav.append(Button.inline("Next ▶️", f"tpg:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    return rows
+
+
+def build_topic_pick(conv):
+    """Text and buttons for the topic step: every topic, with the interrupted one on top."""
+    items = conv.get("topics") or []
+    pair = f"{conv['src_id']}->{conv['dst_id']}"
+    last_tid = get_setting(f"last_topic:{pair}")
+    page = conv.get("topic_page") or 0
+    pages = max(1, (len(items) + TOPIC_PAGE - 1) // TOPIC_PAGE)
+
+    head = (f"✅ Destination: {conv['dst_title']}\n\n"
+            f"📂 Step 3 of 5 — Topic\n\nThis is a topic group with {len(items)} topic(s), "
+            "listed from the bottom.\nPick the one to start with — I'll ask about the rest "
+            f"as we go.\n\nPage {page + 1} of {pages}")
+    rows = []
+    for i, (tid, name) in enumerate(items):
+        if tid == last_tid:
+            lid, _cnt = progress_entry(f"{pair}#{tid}")
+            seen = f" — stopped after ID {lid}" if lid else ""
+            head += f"\n\nLast time you were on: {name}{seen}"
+            rows.append([Button.inline(f"⏯ Continue: {name[:30]}", f"tpk:{i}".encode())])
+            break
+    rows += topic_rows(conv, page)
+    rows.append([Button.inline("✖️ Cancel", b"cancel")])
+    return head, rows
+
+
+async def ask_topic_pick():
+    conv = S().conv
+    conv["step"] = "topic"
+    text, rows = build_topic_pick(conv)
+    await say(text, buttons=rows)
 
 
 async def ask_start():
+    conv = S().conv
     conv["step"] = "start"
-    key = f"{conv['src_id']}->{conv['dst_id']}"
-    last_id = jload(PROGRESS_FILE).get(key, 0)
+    last_id, done_n = progress_entry(progress_key_for(conv))
     rows = [[Button.inline("⏮ From the beginning", b"start:begin")]]
     if last_id:
-        rows.append([Button.inline(f"⏯ Resume (after message ID {last_id})", b"start:resume")])
-    await say(f"✅ Destination: {conv['dst_title']}\n\n"
-              "📍 Step 3 of 4 — Starting point\n\n"
-              "Choose where to start, or send a message ID to start from that message.", buttons=rows)
+        label = (f"⏯ Resume after message ID {last_id}" if not done_n
+                 else f"⏯ Resume after message ID {last_id} ({done_n} copied)")
+        rows.append([Button.inline(label, b"start:resume")])
+    if conv.get("topic_id"):
+        head = f"✅ Topic: {conv['topic_name']}\n\n📍 Step 4 of 5 — Starting point"
+    else:
+        head = f"✅ Destination: {conv['dst_title']}\n\n📍 Step 3 of 4 — Starting point"
+    await say(f"{head}\n\n"
+              "Send a message ID to start from, or choose below.", buttons=rows)
+
+
+async def show_extras():
+    conv = S().conv
+    conv["step"] = "extras"
+    rules = conv["rules"] or []
+    lr = conv["link_rules"] or []
+    footer = conv["footer_text"]
+    rows = [
+        [Button.inline(("✅" if rules else "➕") + f" Replace words ({len(rules)})", b"ex:words")],
+        [Button.inline(("✅" if lr else "➕") + f" Replace links ({len(lr)})", b"ex:links")],
+        [Button.inline(("🖼 Thumbnail: set" if conv["thumb"] else "➕ Add thumbnail"), b"ex:thumb")],
+        [Button.inline(("📝 Caption/promo: set" if footer else "➕ Add caption / promo link"), b"ex:cap")],
+        [Button.inline("✅ Done — review & start", b"ex:done")],
+        [Button.inline("✖️ Cancel", b"cancel")],
+    ]
+    await say("⚙️ Step 4 of 4 — Extras (all optional)\n\n"
+              "Set any of these, then tap Done:\n"
+              f"• Replace words (captions/file names): {len(rules)} rule(s)\n"
+              f"• Replace hidden hyperlink URLs: {len(lr)} rule(s)\n"
+              f"• Custom thumbnail: {'yes' if conv['thumb'] else 'no'}\n"
+              f"• Extra caption / promo link: {'yes (' + conv['footer_pos'] + ')' if footer else 'no'}",
+              buttons=rows)
 
 
 async def ask_rules():
+    conv = S().conv
     conv["step"] = "rules"
-    rows = [[Button.inline("⏭ Skip (no changes)", b"rules:skip")]]
+    rows = [[Button.inline("⏭ Clear (no word rules)", b"rules:skip")]]
     prev = get_setting("rules") or []
     if prev:
         rows.insert(0, [Button.inline(f"♻️ Use previous rules ({len(prev)})", b"rules:prev")])
-    await say("✏️ Step 4 of 4 — Replace words (optional)\n\n"
-              "I can replace words in captions/text and in file names while copying.\n"
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("✏️ Replace words\n\n"
+              "I can replace words in captions/text and in file names.\n"
               "Send one rule per line like this:\n\n"
               "old word => new word\n\n"
               "Example:\nLecture => Class\n@oldchannel => @newchannel\n\n"
-              "Matching ignores upper/lower case. Leave the right side empty to remove a word. "
-              "You can send many rules in one message.", buttons=rows)
+              "Matching ignores upper/lower case. Leave the right side empty to remove a word.",
+              buttons=rows)
 
 
 async def ask_scope():
+    conv = S().conv
     conv["step"] = "scope"
-    await say(f"✅ {len(conv['rules'])} rule(s) saved.\n\nWhere should they be applied?",
+    await say(f"✅ {len(conv['rules'])} word rule(s) saved.\n\nWhere should they be applied?",
               buttons=[[Button.inline("📝 Captions & file names", b"scope:both")],
                        [Button.inline("📝 Captions / text only", b"scope:text")],
                        [Button.inline("📁 File names only", b"scope:names")]])
 
 
+async def ask_links():
+    conv = S().conv
+    conv["step"] = "links"
+    rows = [[Button.inline("⏭ Clear (no link rules)", b"links:skip")]]
+    prev = get_setting("link_rules") or []
+    if prev:
+        rows.insert(0, [Button.inline(f"♻️ Use previous link rules ({len(prev)})", b"links:prev")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("🔗 Replace links (hidden hyperlink URLs)\n\n"
+              "This rewrites the URL hidden inside clickable text (e.g. [Join](https://t.me/old)).\n"
+              "Send one rule per line:\n\n"
+              "old => new\n\n"
+              "Example:\nt.me/oldchannel => t.me/newchannel\nhttps://old.site => https://new.site\n\n"
+              "Matching ignores upper/lower case.",
+              buttons=rows)
+
+
+async def ask_thumb():
+    conv = S().conv
+    conv["step"] = "thumb"
+    rows = []
+    saved = get_setting("thumb_path")
+    if saved and os.path.exists(saved) and conv["thumb"] != saved:
+        rows.append([Button.inline("♻️ Use last saved thumbnail", b"thumb:saved")])
+    if conv["thumb"]:
+        rows.append([Button.inline("🗑 Remove thumbnail", b"thumb:remove")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    await say("🖼 Custom thumbnail\n\n"
+              "Send me a photo to use as the thumbnail for copied videos and documents.\n"
+              "Those files are re-uploaded (downloaded then sent again), so they take longer.\n"
+              "Photos in the source are copied as-is (thumbnails don't apply to photos).",
+              buttons=rows)
+
+
+async def ask_caption():
+    conv = S().conv
+    conv["step"] = "caption"
+    footer = conv["footer_text"]
+    rows = []
+    if footer:
+        other = "prepend" if conv["footer_pos"] == "append" else "append"
+        rows.append([Button.inline(f"↕️ Position: {conv['footer_pos']} (tap to {other})", b"cap:pos")])
+        rows.append([Button.inline("🗑 Remove caption", b"cap:remove")])
+    rows.append([Button.inline("⬅️ Back to extras", b"ex:back")])
+    cur = f"\n\nCurrent ({conv['footer_pos']}):\n{footer}" if footer else ""
+    await say("📝 Caption / promo link\n\n"
+              "Send the extra text to add to every caption. For a clickable promo link use markdown:\n\n"
+              "[Join our channel](https://t.me/yourchannel)\n\n"
+              "You can mix normal text and links. Send new text to replace the current one." + cur,
+              buttons=rows)
+
+
 async def show_copy_confirm():
+    conv = S().conv
     conv["step"] = "confirm"
     rules = conv["rules"] or []
+    lr = conv["link_rules"] or []
     scope = {"both": "captions & file names", "text": "captions only", "names": "file names only"}.get(conv["scope"] or "both")
     lines = ["✅ Everything is ready.\n",
              f"Source: {conv['src_title']}",
-             f"Destination: {conv['dst_title']}",
-             f"Start: {conv['start_label']}"]
+             f"Destination: {conv['dst_title']}"]
+    if conv.get("topic_id"):
+        lines.append(f"Topic: {conv['topic_name']} (I'll ask about the next topics as we go)")
+    lines.append(f"Start: {conv['start_label']}")
     if rules:
-        lines.append(f"Replace rules: {len(rules)} ({scope})")
-        for o, n in rules[:8]:
+        lines.append(f"Word rules: {len(rules)} ({scope})")
+        for o, n in rules[:6]:
             lines.append(f"   {o} → {n if n else '(remove)'}")
-        if len(rules) > 8:
-            lines.append(f"   …and {len(rules) - 8} more")
-    else:
-        lines.append("Replace rules: none")
-    if rules and conv["scope"] in ("both", "names"):
-        lines.append("\nNote: renamed files are downloaded and uploaded again, so they take longer.")
+        if len(rules) > 6:
+            lines.append(f"   …and {len(rules) - 6} more")
+    if lr:
+        lines.append(f"Link rules: {len(lr)}")
+        for o, n in lr[:4]:
+            lines.append(f"   {o} → {n}")
+    if conv["thumb"]:
+        lines.append("Custom thumbnail: on")
+    if conv["footer_text"]:
+        lines.append(f"Caption/promo ({conv['footer_pos']}): {conv['footer_text'][:60]}")
+    if not (rules or lr or conv["thumb"] or conv["footer_text"]):
+        lines.append("Extras: none")
+    if (rules and conv["scope"] in ("both", "names")) or conv["thumb"]:
+        lines.append("\nNote: renamed files and files with a custom thumbnail are downloaded and uploaded again, so they take longer.")
     await say("\n".join(lines), buttons=[[Button.inline("▶️ Start copying", b"go")],
+                                         [Button.inline("⬅️ Back to extras", b"ex:back")],
                                          [Button.inline("✖️ Cancel", b"cancel")]])
 
 
 async def copy_next():
+    conv = S().conv
     if conv["src"] is None:
         await ask_src()
     elif conv["dst"] is None:
         await ask_dst()
+    elif conv.get("topics") and conv.get("topic_id") is None:
+        await ask_topic_pick()          # only for topic groups; channels skip this
     elif conv["start"] is None:
         await ask_start()
-    elif conv["rules"] is None:
-        await ask_rules()
-    elif conv["rules"] and conv["scope"] is None:
-        await ask_scope()
     else:
-        await show_copy_confirm()
+        await show_extras()
 
 
 async def set_src(ref):
+    conv = S().conv
     try:
         ent = await resolve(ref, "Source channel")
     except BadInput as e:
@@ -762,17 +2226,24 @@ async def set_src(ref):
         await say(f"❌ {e}\n\nPlease send the source again, or /stop.")
         return False
     conv.update(src=ref, src_id=ent.id, src_title=title_of(ent))
+    # a topic group gets an extra step later; None means plain channel
+    try:
+        conv["topics"] = await list_topics(S().client, ent)
+    except Exception:
+        conv["topics"] = None
     return True
 
 
 async def set_dst(ref):
+    sess = S()
+    conv = sess.conv
     try:
         ent = await resolve(ref, "Destination channel")
         if ent.id == conv["src_id"]:
             raise BadInput("The source and destination are the same channel. Please choose a different destination.")
         if isinstance(ent, Channel) and ent.broadcast:
             try:
-                perms = await client.get_permissions(ent)
+                perms = await sess.client.get_permissions(ent)
                 if not (perms.is_creator or perms.is_admin):
                     raise BadInput("Your account is not an admin of the destination channel. "
                                    "Please make it an admin with permission to post, then send the destination again.")
@@ -789,33 +2260,154 @@ async def set_dst(ref):
 
 
 def set_start_from_id(n):
+    conv = S().conv
     conv["start"] = max(0, n - 1)
     conv["start_label"] = f"message ID {n}" if n > 0 else "the beginning"
 
 
+async def save_thumb_from(event):
+    """Downloads a photo the user sent and stores it as their thumbnail."""
+    sess = S()
+    conv = sess.conv
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    dst = os.path.join(THUMB_DIR, f"{sess.user_id}.jpg")
+    tmpf = None
+    try:
+        tmpf = await event.message.download_media(file=tempfile.mktemp(suffix=".img", dir=DOWNLOAD_DIR))
+        ok = normalize_thumb(tmpf, dst)
+    except Exception:
+        ok = False
+    finally:
+        if tmpf and os.path.exists(tmpf):
+            try:
+                os.remove(tmpf)
+            except Exception:
+                pass
+    if ok:
+        conv["thumb"] = dst
+        set_setting("thumb_path", dst)
+        await say("✅ Thumbnail saved.")
+        await show_extras()
+    else:
+        await say("❌ I couldn't process that image. Please send a normal photo, or tap Back.")
+
+
+# ----------------------------- guided create flow -----------------------------
 async def ask_create_name():
+    conv = S().conv
     conv["step"] = "c_name"
     await say("🆕 Step 1 of 2 — Channel name\n\nSend the name to use for all the channels (spaces are fine).\n"
               "Send /stop to cancel.")
 
 
 async def ask_create_count():
+    conv = S().conv
     conv["step"] = "c_count"
     await say(f"✅ Name: {conv['name']}\n\n🔢 Step 2 of 2 — How many?\n\n"
               f"Send the number of channels to create (1 to {MAX_COUNT}).")
 
 
 async def show_create_confirm():
+    conv = S().conv
     conv["step"] = "c_confirm"
     await say(f"✅ Ready.\n\nName: {conv['name']}\nCount: {conv['count']}\n"
               f"Restricted (no forwarding): {'yes' if RESTRICT else 'no'}",
               buttons=[[Button.inline("▶️ Create channels", b"go")], [Button.inline("✖️ Cancel", b"cancel")]])
 
 
+# ----------------------------- login flow -----------------------------
+async def _finish_login(sess):
+    sess.client = sess.login_client
+    sess.login_client = None
+    sess.dialogs_loaded = False
+    session_strings[str(sess.user_id)] = sess.client.session.save()
+    save_sessions()
+    try:
+        me = await sess.client.get_me()
+        sess.name = me.first_name or "there"
+        who = me.first_name or "your account"
+    except Exception:
+        who = "your account"
+    sess.reset_conv()
+    await say(f"✅ Logged in as {who}.\n\nYou can now use /copy and /create. Send /help for the guide.")
+
+
+async def login_phone(text):
+    sess = S()
+    conv = sess.conv
+    phone = re.sub(r"[^\d+]", "", text)
+    if not re.fullmatch(r"\+?\d{7,15}", phone):
+        await say("❌ That doesn't look like a valid phone number.\nSend it in international format, e.g. +919876543210, or /stop.")
+        return
+    try:
+        sess.login_client = TelegramClient(StringSession(), api_id, api_hash)
+        await sess.login_client.connect()
+        sent = await sess.login_client.send_code_request(phone)
+    except PhoneNumberInvalidError:
+        await say("❌ Telegram says that phone number is invalid. Send a valid one, or /stop.")
+        return
+    except FloodWaitError as e:
+        await say(f"⏳ Too many attempts. Telegram asked to wait {fmt_duration(e.seconds)}. Try /login later.")
+        sess.reset_conv()
+        return
+    except Exception as e:
+        await say(f"❌ Couldn't send the code: {e}\n\nCheck the number and send /login to try again.")
+        sess.reset_conv()
+        return
+    conv["phone"] = phone
+    conv["phone_code_hash"] = sent.phone_code_hash
+    conv["step"] = "login_code"
+    await say("📩 I sent a login code to your Telegram app.\n\n"
+              "Type the code here, but put spaces or dashes between the digits so Telegram doesn't block it.\n"
+              "For example: 1 2 3 4 5  or  1-2-3-4-5\n\n"
+              "Send /stop to cancel.")
+
+
+async def login_code(text):
+    sess = S()
+    conv = sess.conv
+    code = re.sub(r"\D", "", text)
+    if not code:
+        await say("Please send the digits of the code (spaces or dashes between them are fine), or /stop.")
+        return
+    try:
+        await sess.login_client.sign_in(phone=conv["phone"], code=code, phone_code_hash=conv["phone_code_hash"])
+    except SessionPasswordNeededError:
+        conv["step"] = "login_password"
+        await say("🔒 Your account uses two-step verification.\nSend your password here to finish logging in, or /stop.")
+        return
+    except PhoneCodeInvalidError:
+        await say("❌ That code is wrong. Type it again (spaces/dashes between digits are fine), or /stop.")
+        return
+    except PhoneCodeExpiredError:
+        await say("❌ The code expired. Send /login to get a new one.")
+        sess.reset_conv()
+        return
+    except Exception as e:
+        await say(f"❌ Login failed: {e}\n\nSend /login to try again.")
+        sess.reset_conv()
+        return
+    await _finish_login(sess)
+
+
+async def login_password(text):
+    sess = S()
+    try:
+        await sess.login_client.sign_in(password=text.strip())
+    except PasswordHashInvalidError:
+        await say("❌ Wrong password. Send it again, or /stop.")
+        return
+    except Exception as e:
+        await say(f"❌ Login failed: {e}\n\nSend /login to try again.")
+        sess.reset_conv()
+        return
+    await _finish_login(sess)
+
+
 # ----------------------------- commands -----------------------------
 async def cmd_start(arg):
-    reset_conv()
-    await say(WELCOME.format(name=my_name))
+    S().reset_conv()
+    await say(WELCOME.format(name=S().name))
 
 
 async def cmd_help(arg):
@@ -827,20 +2419,93 @@ async def cmd_about(arg):
 
 
 async def cmd_ping(arg):
-    await say(f"🏓 Pong! I'm online.\nUptime: {fmt_duration(time.time() - started_at)}")
+    await say(f"🏓 Pong! I'm online.\nUptime: {fmt_duration(time.time() - S().started_at)}")
+
+
+async def cmd_login(arg):
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first if you want to switch accounts.")
+        return
+    if await ensure_client(sess):
+        try:
+            me = await sess.client.get_me()
+            who = me.first_name or "your account"
+        except Exception:
+            who = "your account"
+        await say(f"✅ You're already logged in as {who}.\nSend /logout first if you want to use a different account.")
+        return
+    sess.reset_conv()
+    sess.conv["kind"] = "login"
+    sess.conv["step"] = "login_phone"
+    await say("🔐 Let's connect your Telegram account.\n\n"
+              "Send your phone number in international format, e.g. +919876543210.\n\n"
+              "⚠️ Logging in lets this bot act on your behalf (copy content, create channels). "
+              "Only do this with a bot you trust. Send /stop to cancel.")
+
+
+async def cmd_logout(arg):
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first.")
+        return
+    c = await ensure_client(sess)
+    if not c and str(sess.user_id) not in session_strings:
+        await say("You're not logged in. Send /login to connect an account.")
+        return
+    try:
+        if c:
+            await c.log_out()
+    except Exception:
+        pass
+    try:
+        if sess.client and sess.client.is_connected():
+            await sess.client.disconnect()
+    except Exception:
+        pass
+    sess.client = None
+    sess.dialogs_loaded = False
+    sess.name = "there"
+    session_strings.pop(str(sess.user_id), None)
+    save_sessions()
+    sess.reset_conv()
+    await say("👋 Logged out. Your session has been removed from the bot.\nSend /login to connect again.")
+
+
+async def cmd_speed(arg):
+    arg = arg.strip().replace(",", ".")
+    if not arg:
+        await say(f"⚡ Delay between copied messages: {get_delay()}s.\n\n"
+                  "Change it with: /speed <seconds>  (e.g. /speed 0.8)\n"
+                  "Lower = faster, but too low makes Telegram pause you (flood wait).\n"
+                  "Allowed range: 0.3 – 10 seconds. Applies to your next copy.")
+        return
+    try:
+        v = float(arg)
+    except ValueError:
+        await say("❌ Please send a number, e.g. /speed 0.8")
+        return
+    if not (0.3 <= v <= 10):
+        await say("❌ Please choose a value between 0.3 and 10 seconds.")
+        return
+    set_setting("delay", v)
+    note = "\n⚠️ That's quite fast — if you start seeing flood waits, raise it a little." if v < 1 else ""
+    await say(f"✅ Delay set to {v}s between messages." + note +
+              ("\n(A copy is running now — this takes effect on your next copy.)" if S().job["running"] else ""))
 
 
 async def cmd_status(arg):
-    if job["running"] or job["kind"]:
+    sess = S()
+    if sess.job["running"] or sess.job["kind"]:
         await say(render_job())
-    elif conv["kind"]:
+    elif sess.conv["kind"]:
         await say("📝 A request is in progress. Please continue with the last question, or send /stop to discard it.")
     else:
         await say("✅ No task is running. Send /copy or /create to start one.")
 
 
 async def cmd_errors(arg):
-    errs = job["errors"]
+    errs = S().job["errors"]
     if not errs:
         await say("✅ No errors recorded.")
         return
@@ -852,21 +2517,32 @@ async def cmd_errors(arg):
 
 
 async def cmd_stop(arg):
-    if job["running"]:
-        job["stop"] = True
+    sess = S()
+    fut = sess.job.get("pending")
+    if fut is not None and not fut.done():
+        sess.job["stop"] = True
+        fut.set_result("stop")
+        await say("🛑 Stopping…")
+        return
+    if sess.job["running"]:
+        sess.job["stop"] = True
         await say("🛑 Stopping after the current item…")
-    elif conv["kind"]:
-        reset_conv()
+    elif sess.conv["kind"]:
+        sess.reset_conv()
         await say("Cancelled. Send /copy or /create whenever you're ready.")
     else:
         await say("There is nothing to stop right now.")
 
 
 async def cmd_copy(arg):
-    if job["running"]:
+    sess = S()
+    if sess.job["running"]:
         await say("⚠️ A task is already running. Send /status to see it or /stop to stop it.")
         return
-    reset_conv()
+    if not await require_login(sess):
+        return
+    sess.reset_conv()
+    conv = sess.conv
     conv["kind"] = "copy"
     parts = arg.split()
     if len(parts) > 3:
@@ -897,10 +2573,14 @@ async def cmd_copy(arg):
 
 
 async def cmd_create(arg):
-    if job["running"]:
+    sess = S()
+    if sess.job["running"]:
         await say("⚠️ A task is already running. Send /status to see it or /stop to stop it.")
         return
-    reset_conv()
+    if not await require_login(sess):
+        return
+    sess.reset_conv()
+    conv = sess.conv
     conv["kind"] = "create"
     parts = arg.rsplit(None, 1)
     if len(parts) == 2 and parts[1].isdigit():
@@ -916,33 +2596,52 @@ async def cmd_create(arg):
 
 
 COMMANDS = {
-    "/start": cmd_start, "/help": cmd_help, "/copy": cmd_copy, "/create": cmd_create,
-    "/status": cmd_status, "/errors": cmd_errors, "/stop": cmd_stop, "/cancel": cmd_stop,
-    "/ping": cmd_ping, "/about": cmd_about,
+    "/start": cmd_start, "/help": cmd_help, "/login": cmd_login, "/logout": cmd_logout,
+    "/copy": cmd_copy, "/create": cmd_create, "/status": cmd_status, "/errors": cmd_errors,
+    "/speed": cmd_speed, "/stop": cmd_stop, "/cancel": cmd_stop, "/ping": cmd_ping, "/about": cmd_about,
 }
 
 
 # ----------------------------- free text -----------------------------
 async def handle_text(event, text):
+    sess = S()
+    conv = sess.conv
+    # a running copy can be waiting for a starting message id for the current topic
+    fut = sess.job.get("pending")
+    if fut is not None and not fut.done() and sess.job.get("pending_kind") == "start_id":
+        if text.strip().isdigit():
+            fut.set_result(int(text.strip()))
+        else:
+            await say("Please send a message ID (just the number), or use the buttons above.")
+        return
     step = conv["step"]
     fwd = fwd_channel_id(event.message)
 
-    if step == "src":
-        try:
-            ref = fwd or check_ref(text.split()[0] if text.split() else "", "Source")
-        except BadInput as e:
-            await say(f"❌ {e}\n\nSend the channel ID (-100...) or @username, forward a message from it, or /stop.")
+    if step == "login_phone":
+        await login_phone(text)
+    elif step == "login_code":
+        await login_code(text)
+    elif step == "login_password":
+        await login_password(text)
+    elif step == "thumb":
+        msg = event.message
+        is_image = bool(msg.photo) or (msg.document and (getattr(msg.document, "mime_type", "") or "").startswith("image/"))
+        if is_image:
+            await save_thumb_from(event)
+        else:
+            await say("Please send a photo to use as the thumbnail, or tap Back.")
+    elif step == "caption":
+        if not text.strip():
+            await say("Please send some text for the caption, or tap Back.")
             return
-        if await set_src(ref):
-            await copy_next()
+        conv["footer_text"] = text.strip()
+        set_setting("footer_text", conv["footer_text"])
+        await say("✅ Caption/promo text saved.")
+        await ask_caption()
+    elif step == "src":
+        await handle_channel_text("src", text, fwd)
     elif step == "dst":
-        try:
-            ref = fwd or check_ref(text.split()[0] if text.split() else "", "Destination")
-        except BadInput as e:
-            await say(f"❌ {e}\n\nSend the channel ID (-100...) or @username, forward a message from it, or /stop.")
-            return
-        if await set_dst(ref):
-            await copy_next()
+        await handle_channel_text("dst", text, fwd)
     elif step == "start":
         if text.isdigit():
             set_start_from_id(int(text))
@@ -953,18 +2652,36 @@ async def handle_text(event, text):
         pairs, bad = parse_rules(text)
         if bad:
             await say("❌ I couldn't read these line(s):\n" + "\n".join(f"• {b}" for b in bad[:8]) +
-                      "\n\nUse the format: old word => new word\nSend all rules again, or tap Skip.")
+                      "\n\nUse the format: old word => new word\nSend all rules again, or tap Back.")
             return
         if not pairs:
-            await say("I couldn't find any rule. Use the format: old word => new word, one per line, or tap Skip.")
+            await say("I couldn't find any rule. Use the format: old word => new word, one per line.")
             return
         if len(pairs) > 100:
             await say("❌ Please send at most 100 rules.")
             return
         conv["rules"] = pairs
         set_setting("rules", pairs)
-        await copy_next()
-    elif step in ("scope", "confirm", "c_confirm"):
+        await ask_scope()
+    elif step == "links":
+        pairs, bad = parse_rules(text)
+        if bad:
+            await say("❌ I couldn't read these line(s):\n" + "\n".join(f"• {b}" for b in bad[:8]) +
+                      "\n\nUse the format: old => new\nSend all rules again, or tap Back.")
+            return
+        if not pairs:
+            await say("I couldn't find any rule. Use the format: old => new, one per line.")
+            return
+        if len(pairs) > 100:
+            await say("❌ Please send at most 100 rules.")
+            return
+        conv["link_rules"] = pairs
+        set_setting("link_rules", pairs)
+        await say(f"✅ {len(pairs)} link rule(s) saved.")
+        await show_extras()
+    elif step == "topic":
+        await say("Please pick a topic using the buttons above, or send /stop to cancel.")
+    elif step in ("scope", "extras", "confirm", "c_confirm"):
         await say("Please choose an option using the buttons above, or send /stop to cancel.")
     elif step == "c_name":
         name = text.strip()
@@ -981,11 +2698,13 @@ async def handle_text(event, text):
             await say(f"❌ Please send a number between 1 and {MAX_COUNT}.")
     else:
         if GREETING_RE.match(text):
-            await say(f"Hello, {my_name}! 👋 How can I help you today?\nSend /copy to copy a channel, /create to create channels, or /help.")
+            await say(f"Hello, {sess.name}! 👋 How can I help you today?\n"
+                      "Send /login to connect your account, then /copy or /create. Send /help for all commands.")
         elif THANKS_RE.match(text):
             await say("You're welcome! Let me know if you need anything else.")
         else:
-            await say("I can copy content between channels and create channels.\nSend /copy or /create to begin, or /help for all commands.")
+            await say("I can copy content between channels and create channels on your account.\n"
+                      "Send /login to connect, then /copy or /create, or /help for all commands.")
 
 
 async def handle_message(event):
@@ -1007,36 +2726,82 @@ async def handle_message(event):
 async def on_message(event):
     if not event.is_private:
         return
-    if event.sender_id != my_id:
-        await event.respond(
-            "🔒 This is a private assistant and can only be used by its owner.\n\n"
-            f"Your Telegram ID: {event.sender_id}\n"
-            "If this is your own bot and you still see this message, your SESSION_STRING belongs to a "
-            "different account than the one you are chatting from. Generate a new one with that account.",
-            parse_mode=None)
-        return
+    sess = get_sess(event.sender_id)
+    _cur.set(sess)
+    if sess.name == "there":
+        try:
+            sender = await event.get_sender()
+            sess.name = getattr(sender, "first_name", None) or "there"
+        except Exception:
+            pass
     try:
         await handle_message(event)
     except Exception as e:
         print(f"Handler error: {e}")
-        await say(f"⚠️ Something went wrong: {e}")
+        try:
+            await say(f"⚠️ Something went wrong: {e}")
+        except Exception:
+            pass
 
 
 @bot.on(events.CallbackQuery)
 async def on_button(event):
-    if event.sender_id != my_id:
-        await event.answer("This assistant is private.", alert=True)
-        return
+    sess = get_sess(event.sender_id)
+    _cur.set(sess)
     data = (event.data or b"").decode()
+    conv = sess.conv
     step = conv["step"]
 
     async def expired():
         await event.answer("This request has expired. Please start again.", alert=True)
 
     try:
-        if data == "cancel":
+        if data in ("st:begin", "st:resume", "st:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "start_id":
+                return await expired()
             await event.answer()
-            reset_conv()
+            try:
+                await event.edit({"st:begin": "⏮ Starting from the beginning…",
+                                  "st:resume": "⏯ Resuming where it stopped…",
+                                  "st:stop": "🛑 Stopping the copy."}[data])
+            except Exception:
+                pass
+            if data == "st:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data in ("tp:copy", "tp:skip", "tp:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "topic":
+                return await expired()
+            await event.answer()
+            try:
+                await event.edit({"tp:copy": "✅ Copying this topic…",
+                                  "tp:skip": "⏭ Skipping this topic.",
+                                  "tp:stop": "🛑 Stopping the copy."}[data])
+            except Exception:
+                pass
+            if data == "tp:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data in ("job:retry", "job:skip", "job:stop"):
+            fut = sess.job.get("pending")
+            if fut is None or fut.done() or sess.job.get("pending_kind") != "retry":
+                return await expired()
+            await event.answer()
+            label = {"job:retry": "🔁 Retrying this file…",
+                     "job:skip": "⏭ Skipping this file.",
+                     "job:stop": "🛑 Stopping the copy."}[data]
+            try:
+                await event.edit(label)
+            except Exception:
+                pass
+            if data == "job:stop":
+                sess.job["stop"] = True
+            fut.set_result(data.split(":", 1)[1])
+        elif data == "cancel":
+            await event.answer()
+            sess.reset_conv()
             await event.edit("Cancelled. Send /copy or /create whenever you're ready.")
         elif data == "src:last" and step == "src":
             last = get_setting("last_src")
@@ -1054,34 +2819,131 @@ async def on_button(event):
             await event.edit(f"Destination selected: {last['title']}")
             if await set_dst(last["ref"]):
                 await copy_next()
+        elif data.startswith("pg:"):
+            try:
+                _, kind, page = data.split(":")
+            except ValueError:
+                return await expired()
+            conv[f"pick_{kind}_page"] = int(page)
+            text, rows = build_pick(kind, src_header() if kind == "src" else dst_header())
+            await event.answer()
+            try:
+                await event.edit(text, buttons=rows)
+            except Exception:
+                pass
+        elif data.startswith("tpg:") and step == "topic":
+            await event.answer()
+            conv["topic_page"] = int(data.split(":", 1)[1])
+            text, rows = build_topic_pick(conv)
+            try:
+                await event.edit(text, buttons=rows)
+            except Exception:
+                pass
+        elif data.startswith("tpk:") and step == "topic":
+            idx = int(data.split(":", 1)[1])
+            items = conv.get("topics") or []
+            if idx >= len(items):
+                return await expired()
+            tid, name = items[idx]
+            await event.answer()
+            await event.edit(f"Topic selected: {name}")
+            conv.update(topic_id=tid, topic_name=name)
+            await copy_next()
+        elif data.startswith("pk:"):
+            try:
+                _, kind, idx = data.split(":")
+                idx = int(idx)
+            except ValueError:
+                return await expired()
+            items = conv.get(f"pick_{kind}") or []
+            if idx >= len(items) or step != kind:
+                return await expired()
+            cid, title = items[idx]
+            await event.answer()
+            await event.edit(f"Selected: {title}")
+            if kind == "src":
+                if await set_src(cid):
+                    await copy_next()
+            else:
+                if await set_dst(cid):
+                    await copy_next()
         elif data in ("start:begin", "start:resume") and step == "start":
             await event.answer()
             if data == "start:begin":
-                conv.update(start=0, start_label="the beginning")
+                conv.update(start=0, start_label="the beginning", base_done=0, resume=False)
             else:
-                key = f"{conv['src_id']}->{conv['dst_id']}"
-                last_id = jload(PROGRESS_FILE).get(key, 0)
-                conv.update(start=last_id, start_label=f"resuming after message ID {last_id}")
+                conv["resume"] = True
+                last_id, done_n = progress_entry(progress_key_for(conv))
+                conv.update(start=last_id, base_done=done_n,
+                            start_label=f"resuming after message ID {last_id}"
+                                        + (f" ({done_n} already copied)" if done_n else ""))
             await event.edit(f"Start: {conv['start_label']}")
             await copy_next()
+        # ----- extras hub -----
+        elif data == "ex:words":
+            await event.answer()
+            await ask_rules()
+        elif data == "ex:links":
+            await event.answer()
+            await ask_links()
+        elif data == "ex:thumb":
+            await event.answer()
+            await ask_thumb()
+        elif data == "ex:cap":
+            await event.answer()
+            await ask_caption()
+        elif data == "ex:back":
+            await event.answer()
+            await show_extras()
+        elif data == "ex:done":
+            await event.answer()
+            await show_copy_confirm()
+        # ----- word rules -----
         elif data in ("rules:skip", "rules:prev") and step == "rules":
             await event.answer()
             if data == "rules:skip":
                 conv["rules"] = []
-                await event.edit("Word replacement: skipped")
+                await show_extras()
             else:
-                prev = [tuple(p) for p in (get_setting("rules") or [])]
-                conv["rules"] = prev
-                await event.edit(f"Using the previous {len(prev)} rule(s)")
-            await copy_next()
+                conv["rules"] = [tuple(p) for p in (get_setting("rules") or [])]
+                await ask_scope()
         elif data.startswith("scope:") and step == "scope":
             await event.answer()
             conv["scope"] = data.split(":", 1)[1]
-            await event.edit("Rules applied to: " + {"both": "captions & file names", "text": "captions only",
-                                                      "names": "file names only"}[conv["scope"]])
-            await copy_next()
+            await show_extras()
+        # ----- link rules -----
+        elif data in ("links:skip", "links:prev") and step == "links":
+            await event.answer()
+            if data == "links:skip":
+                conv["link_rules"] = []
+            else:
+                conv["link_rules"] = [tuple(p) for p in (get_setting("link_rules") or [])]
+            await show_extras()
+        # ----- thumbnail -----
+        elif data == "thumb:saved" and step == "thumb":
+            await event.answer()
+            saved = get_setting("thumb_path")
+            if saved and os.path.exists(saved):
+                conv["thumb"] = saved
+                await show_extras()
+            else:
+                await say("No saved thumbnail found. Please send a photo.")
+        elif data == "thumb:remove" and step == "thumb":
+            await event.answer()
+            conv["thumb"] = None
+            await show_extras()
+        # ----- caption / promo -----
+        elif data == "cap:pos" and step == "caption":
+            await event.answer()
+            conv["footer_pos"] = "prepend" if conv["footer_pos"] == "append" else "append"
+            await ask_caption()
+        elif data == "cap:remove" and step == "caption":
+            await event.answer()
+            conv["footer_text"] = None
+            await show_extras()
+        # ----- start -----
         elif data == "go" and step in ("confirm", "c_confirm"):
-            if job["running"]:
+            if sess.job["running"]:
                 await event.answer("Another task is already running.", alert=True)
                 return
             await event.answer()
@@ -1098,48 +2960,92 @@ async def on_button(event):
 
 
 # ----------------------------- startup -----------------------------
-async def main():
-    global my_id, my_name
-    await client.connect()
-    if not await client.is_user_authorized():
-        print("ERROR: SESSION_STRING is invalid or expired. Generate a new one with generate_session.py.")
-        sys.exit(1)
-    me = await client.get_me()
-    my_id = me.id
-    my_name = me.first_name or "there"
+def _quiet_exception_handler(loop, context):
+    # hide harmless asyncio noise from abandoned network coroutines
+    msg = context.get("message", "")
+    if "Task was destroyed but it is pending" in msg:
+        return
+    if isinstance(context.get("exception"), GeneratorExit):
+        return
+    loop.default_exception_handler(context)
 
+
+async def _set_command_menu():
     try:
-        await bot.start(bot_token=bot_token)
-    except Exception as e:
-        print(f"ERROR: BOT_TOKEN looks invalid: {e}")
-        sys.exit(1)
-    bme = await bot.get_me()
-    try:
-        await bot(SetBotCommandsRequest(
+        await asyncio.wait_for(bot(SetBotCommandsRequest(
             scope=BotCommandScopeDefault(), lang_code="",
             commands=[
                 BotCommand("start", "Welcome message"),
+                BotCommand("login", "Connect your Telegram account"),
+                BotCommand("logout", "Disconnect your account"),
                 BotCommand("copy", "Copy a channel (guided)"),
                 BotCommand("create", "Create multiple channels"),
                 BotCommand("status", "Live progress"),
+                BotCommand("speed", "Set delay between messages"),
                 BotCommand("errors", "Detailed error list"),
                 BotCommand("stop", "Stop the current task"),
                 BotCommand("ping", "Check that the bot is online"),
                 BotCommand("about", "About this assistant"),
                 BotCommand("help", "How to use this assistant"),
-            ]))
+            ])), timeout=30)
     except Exception as e:
-        print(f"Could not set the command menu: {e}")
+        print(f"Note: could not set the command menu ({e}); the bot still works.", flush=True)
 
-    print(f"Channel Tools Assistant {VERSION} is running. Account: {my_name} | Bot: @{bme.username}")
-    print(f"Owner account ID: {my_id}")
+
+async def main():
+    # during startup keep Telethon's logs visible so a flood-wait countdown is shown
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("telethon").setLevel(logging.INFO)
+    print(f"Channel Tools Assistant {VERSION}: starting up…", flush=True)
+    if FAST_IMPORT_ERROR:
+        print(f"WARNING: FastTelethon could not be loaded ({FAST_IMPORT_ERROR}). "
+              "Transfers will use the slow single-connection path.", flush=True)
+    else:
+        print(f"Parallel transfer ready (upload={USE_FAST}, download={USE_FAST_DL}, "
+              f"connections={os.environ.get('FT_CONNECTIONS', '8')}).", flush=True)
+    # clear any leftover temp download files from a previous run so they don't fill the disk
     try:
-        await bot.send_message(my_id, "✅ Channel Tools Assistant is online. Send /copy or /create to begin, or /help.",
-                               parse_mode=None)
+        if DOWNLOAD_DIR and os.path.isdir(DOWNLOAD_DIR):
+            for name in os.listdir(DOWNLOAD_DIR):
+                shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
     except Exception as e:
-        print(f"Startup message not sent (open the bot and press Start): {e}")
+        print(f"Temp cleanup skipped: {e}", flush=True)
+    try:
+        bot.loop.set_exception_handler(_quiet_exception_handler)
+    except Exception:
+        pass
+    print("Connecting to Telegram… (if this hangs, Telegram may have rate-limited the bot "
+          "after many quick restarts — just wait a few minutes)", flush=True)
+    try:
+        await bot.start(bot_token=bot_token)
+    except Exception as e:
+        print(f"ERROR: could not start the bot (check BOT_TOKEN / network): {e}", flush=True)
+        sys.exit(1)
+    try:
+        bme = await bot.get_me()
+        uname = bme.username
+    except Exception as e:
+        print(f"WARN: get_me failed ({e})", flush=True)
+        uname = "?"
+    # connected — now quiet the per-transfer connection noise, and stop the bot from sleeping a
+    # long time on its own flood waits (e.g. frequent status edits) which made it respond late
+    logging.getLogger("telethon").setLevel(getattr(logging, LOG_LEVEL, logging.ERROR))
+    bot.flood_sleep_threshold = 30
+    print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
+    print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
+    # set the command menu in the background so it can never hold up startup
+    asyncio.create_task(_set_command_menu())
+    print("Now listening for messages. Send /ping in the bot to test.", flush=True)
+    await bot.run_until_disconnected()
 
-    await asyncio.gather(client.run_until_disconnected(), bot.run_until_disconnected())
 
-
-client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    try:
+        bot.loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Shutting down…", flush=True)        # normal stop, not a crash
+    finally:
+        try:
+            bot.loop.run_until_complete(bot.disconnect())
+        except Exception:
+            pass

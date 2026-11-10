@@ -1,0 +1,11 @@
+# Per-user login sessions (full account access) and runtime state — never commit
+sessions.json
+progress.json
+settings.json
+thumbs/
+dl_tmp/
+*.session
+*.session-journal
+
+__pycache__/
+*.pyc
