@@ -35,6 +35,10 @@ MAX_CONNECTIONS = int(os.environ.get("FT_CONNECTIONS", "8"))
 # upload connections while answering GetFileRequest with repeated short flood waits. Keeping a
 # second knob means download concurrency can be lowered without slowing uploads down.
 MAX_DL_CONNECTIONS = int(os.environ.get("FT_DL_CONNECTIONS", str(MAX_CONNECTIONS)))
+# FT_MAIN_CONN=1 keeps the parallel requests but sends them over the client's existing
+# connection instead of opening new ones. Worth trying when the normal download works yet the
+# parallel one is answered with constant flood waits, which points at the extra connections.
+USE_MAIN_CONN = os.environ.get("FT_MAIN_CONN", "0") == "1"
 
 # Telegram allows at most 512 KB per part for both uploads and downloads. Telethon otherwise
 # picks 128 KB (files <=100 MB) or 256 KB (<=750 MB), which means 2-4x more round trips.
@@ -106,7 +110,7 @@ class ParallelTransferrer:
         return sender
 
     async def run_pool(self, connections: int, part_count: int, do_part: callable,
-                       on_error: list) -> None:
+                       on_error: list, reconnect: bool = True) -> None:
         """Hands out part numbers to the connections. Whoever is free takes the next one, so a
         connection that is retrying only delays its own part instead of the whole transfer."""
         queue: asyncio.Queue = asyncio.Queue()
@@ -131,14 +135,15 @@ class ParallelTransferrer:
                             return
                         print(f"Part {index} failed ({type(e).__name__}: {e}); "
                               f"reconnecting (attempt {attempt + 1}/3)", flush=True)
-                        try:
-                            await self.senders[slot].disconnect()
-                        except Exception:
-                            pass
-                        try:
-                            self.senders[slot] = await self._create_sender()
-                        except Exception:
-                            pass
+                        if reconnect and self.senders:
+                            try:
+                                await self.senders[slot].disconnect()
+                            except Exception:
+                                pass
+                            try:
+                                self.senders[slot] = await self._create_sender()
+                            except Exception:
+                                pass
                         # back off a little: retrying straight away only adds to the rate
                         # limit that caused the failure in the first place
                         await asyncio.sleep(2 * (attempt + 1))
@@ -286,8 +291,10 @@ async def download_file(client: TelegramClient,
         downloader = ParallelTransferrer(client, dc_id)
         connections = max(1, min(downloader._get_connection_count(size, MAX_DL_CONNECTIONS),
                                  part_count))
-        await downloader.init_senders(connections)
-        log.debug(f"Starting parallel download: {connections} {part_size} {part_count}")
+        if not USE_MAIN_CONN:
+            await downloader.init_senders(connections)
+        log.debug(f"Starting parallel download: {connections} {part_size} {part_count} "
+                  f"main_conn={USE_MAIN_CONN}")
 
         got = [0]
         errors = []
@@ -295,8 +302,12 @@ async def download_file(client: TelegramClient,
 
         async def fetch(slot: int, index: int):
             offset = index * part_size
-            result = await client._call(downloader.senders[slot],
-                                        GetFileRequest(location, offset=offset, limit=part_size))
+            request = GetFileRequest(location, offset=offset, limit=part_size)
+            if USE_MAIN_CONN:
+                # several requests in flight, but down the connection the client already has
+                result = await client(request)
+            else:
+                result = await client._call(downloader.senders[slot], request)
             data = result.bytes
             # each part goes straight to its own place in the file, so parts can arrive in any
             # order and one slow connection never holds the others up
@@ -314,7 +325,8 @@ async def download_file(client: TelegramClient,
 
         tick = asyncio.ensure_future(ticker()) if progress_callback else None
         try:
-            await downloader.run_pool(connections, part_count, fetch, errors)
+            await downloader.run_pool(connections, part_count, fetch, errors,
+                                      reconnect=not USE_MAIN_CONN)
         finally:
             if tick is not None:
                 tick.cancel()
