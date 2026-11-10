@@ -39,7 +39,7 @@ except Exception as _e:
     fast_download = None
     FAST_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
-VERSION = "v13"
+VERSION = "v14"
 
 # Telegram moved the "list forum topics" call between API namespaces, and renamed its first
 # argument from `channel` to `peer`, so find whichever this Telethon version ships instead of
@@ -145,6 +145,12 @@ class BadInput(Exception):
     pass
 
 
+class Aborted(Exception):
+    """/stop sent a second time: drop the transfer that is in flight instead of waiting for
+    it to finish. A big album upload can take many minutes, and waiting that long for a stop
+    looks like the bot is ignoring it."""
+
+
 # ----------------------------- per-user session -----------------------------
 class UserSession:
     """Everything that belongs to one logged-in (or logging-in) user."""
@@ -188,7 +194,7 @@ class UserSession:
             force_dl=False,
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
-            pending=None, pending_kind="", paused=False, pending_id=0,
+            pending=None, pending_kind="", paused=False, pending_id=0, abort=False,
             fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False, premium=None,
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
             send_block_until=0.0,
@@ -711,10 +717,19 @@ def render_job():
         tc = f"/{total_c}" if total_c else ""
         if job["ul_tot"]:
             p = job["ul_cur"] / job["ul_tot"] * 100
-            sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
-            mode = {"fast": " ⚡fast", "normal": " (normal)", "album": " (album)"}.get(job.get("ul_mode"), "")
-            lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}{mode}: {p:.1f}% "
-                         f"({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
+            if job.get("ul_mode") == "album":
+                # For an album Telethon reports progress as a fractional file count, not
+                # bytes, so showing it as bytes read "(0 B / 3 B) • 0 B/s" — nonsense that
+                # looked like a stuck upload. Report what the numbers actually mean.
+                total_f = int(job["ul_tot"])
+                cur_f = min(total_f, int(job["ul_cur"]) + 1)
+                lines.append(f"⬆️ Uploading #{job['ul_no']}{tc} (album): file {cur_f} of "
+                             f"{total_f} — {p:.1f}% of the album")
+            else:
+                sp = f" • {fmt_size(job['ul_speed'])}/s" if job["ul_speed"] > 0 else ""
+                mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("ul_mode"), "")
+                lines.append(f"⬆️ Uploading #{job['ul_no']}{tc}{mode}: {p:.1f}% "
+                             f"({fmt_size(job['ul_cur'])} / {fmt_size(job['ul_tot'])}){sp}")
         if job["dl_tot"]:
             p = job["dl_cur"] / job["dl_tot"] * 100
             sp = f" • {fmt_size(job['dl_speed'])}/s" if job["dl_speed"] > 0 else ""
@@ -785,13 +800,17 @@ def render_job():
     return "\n".join(lines)
 
 
-async def refresh(status, force=False):
+async def refresh(status, force=False, last=False):
+    """Updates the live status message. last=True is the final write of a task: it ignores
+    every rate-limit shortcut below, because a task that is over must never be left showing
+    "in progress" — that stale message is the one the user keeps looking at."""
     job = S().job
     now = time.time()
-    if now < (job.get("edit_block_until") or 0.0):
-        return                      # Telegram told us to stop editing for a while
-    if not force and now - (job.get("last_edit") or 0.0) < EDIT_EVERY:
-        return
+    if not last:
+        if now < (job.get("edit_block_until") or 0.0):
+            return                  # Telegram told us to stop editing for a while
+        if not force and now - (job.get("last_edit") or 0.0) < EDIT_EVERY:
+            return
     target = job.get("status_msg") or status
     if target is None:
         return
@@ -800,7 +819,7 @@ async def refresh(status, force=False):
     # the whole text can stay identical. Editing it then returns "message was not modified",
     # which used to be counted as a failure and answered with a brand new status message every
     # few seconds: that froze the message being watched and eventually got sending rate-limited.
-    if text == job.get("last_text"):
+    if text == job.get("last_text") and not last:
         return
     job["last_edit"] = now
     try:
@@ -814,6 +833,10 @@ async def refresh(status, force=False):
         job["edit_block_until"] = time.time() + e.seconds + 1
         print(f"Status edits paused for {e.seconds}s (Telegram rate limit); the copy continues.",
               flush=True)
+        if last:
+            # the task is over: say so in a new message rather than leaving the old one
+            # stuck on "in progress" until the rate limit expires
+            await say(text)
     except Exception as e:
         if type(e).__name__ == "MessageNotModifiedError" or "not modified" in str(e).lower():
             job["last_text"] = text     # nothing to change; not a failure
@@ -1010,9 +1033,17 @@ async def wait_flood(e):
     # also log it, in case Telegram is blocking our messages and /status can't be updated
     print(f"Flood wait {e.seconds}s ({fmt_duration(e.seconds)}); auto-resuming after that "
           f"at message ID {job.get('cur_id', 0)}.", flush=True)
-    await asyncio.sleep(e.seconds + 1)
+    # sleep in short steps so /stop twice takes effect during a long wait instead of
+    # leaving the user staring at a countdown they already asked to abandon
+    end = job["flood_until"]
+    while True:
+        left = end - time.time()
+        if left <= 0 or job.get("abort"):
+            break
+        await asyncio.sleep(min(2.0, max(0.1, left)))
     job["flood_until"] = 0.0
-    print("Flood wait over, continuing.", flush=True)
+    print("Flood wait over, continuing." if not job.get("abort")
+          else "Flood wait cut short: the user asked to stop.", flush=True)
 
 
 def make_captioner(opts):
@@ -1099,9 +1130,11 @@ async def with_stall_guard(coro, prefix):
     last_cur, last_change = -1, time.time()
     try:
         while True:
-            done, _ = await asyncio.wait({task}, timeout=5)
+            done, _ = await asyncio.wait({task}, timeout=1)
             if task in done:
                 return task.result()
+            if job.get("abort"):
+                raise Aborted("stopped by the user")
             if job["flood_until"] > time.time():
                 last_change = time.time()        # waiting on Telegram, not a stall
                 continue
@@ -1125,7 +1158,7 @@ async def run_transfer(make_coro, prefix, attempts=RETRY_ATTEMPTS):
     for _ in range(attempts):
         try:
             return await with_stall_guard(make_coro(), prefix)
-        except FloodWaitError:
+        except (FloodWaitError, Aborted):
             raise
         except TimeoutError as e:
             last = e
@@ -1268,6 +1301,8 @@ async def send_group(dst, group, prepared, opts):
             if not raw.strip():
                 return False, None, None
             while True:
+                if job.get("abort"):
+                    return False, Aborted("stopped by the user"), None
                 try:
                     await client.send_message(dst, raw, link_preview=False, **ent_kw(ents))
                     return True, None, None
@@ -1277,6 +1312,8 @@ async def send_group(dst, group, prepared, opts):
             try:
                 await run_transfer(lambda: do_upload(client, dst, prepared, opts), "ul")
                 return True, None, extra_tmp
+            except Aborted as e:
+                return False, e, extra_tmp
             except FloodWaitError as e:
                 await wait_flood(e)
             except Exception as e:
@@ -1468,6 +1505,11 @@ async def process_with_retry(dst, group, opts, prepared=None):
             job["bytes_done"] += nbytes
             return
         if status == "skip":
+            job["skipped"] += len(group)
+            return
+        if isinstance(err, Aborted):
+            # the user asked to stop right now: end the task instead of offering a retry
+            job["stop"] = True
             job["skipped"] += len(group)
             return
         # failure — record it and ask the user (no automatic skipping)
@@ -1680,6 +1722,11 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
     client = sess.client
     job = sess.job
     rules = opts["rules"]
+    # Start from a completely clean job. Updating only some fields used to leave the previous
+    # task's state behind: status_msg still pointed at the OLD status message, so this task's
+    # progress was written into the finished task's message and its own status never moved.
+    # edit_block_until, last_text, force_dl and the topic counters leaked the same way.
+    sess.reset_job()
     job.update(running=True, stop=False, kind="copy", phase="running", started=time.time(),
                last_edit=0.0, src="", dst="", done=0, failed=0, skipped=0, bytes_done=0,
                cur_id=min_id, min_id=min_id, top_id=min_id, errors=[], flood_until=0.0,
@@ -1768,7 +1815,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
             ticker_task.cancel()
         job["last_result"] = render_job()
         if status is not None:
-            await refresh(status, force=True)
+            await refresh(status, force=True, last=True)
             if (job["phase"] == "done" and not job.get("topic_total")
                     and job["done"] == 0 and job["failed"] == 0 and job["skipped"] == 0):
                 await say(f"ℹ️ There was nothing new to copy after message ID {min_id}.\n"
@@ -1783,6 +1830,7 @@ async def run_create(name, count):
     sess = S()
     client = sess.client
     job = sess.job
+    sess.reset_job()            # same clean slate as a copy; no state from the last task
     job.update(running=True, stop=False, kind="create", phase="running", started=time.time(),
                last_edit=0.0, name=name, done=0, total=count, errors=[], flood_until=0.0,
                rules_n=0, link_n=0, has_thumb=False, has_footer=False)
@@ -1819,7 +1867,7 @@ async def run_create(name, count):
         job["running"] = False
         job["flood_until"] = 0.0
         job["last_result"] = render_job()
-        await refresh(status, force=True)
+        await refresh(status, force=True, last=True)
         await say("🔔 Task finished. Send /status for details.")
 
 
@@ -2538,8 +2586,17 @@ async def cmd_stop(arg):
         await say("🛑 Stopping…")
         return
     if sess.job["running"]:
-        sess.job["stop"] = True
-        await say("🛑 Stopping after the current item…")
+        if sess.job["stop"]:
+            # already stopping: a big album upload can take many minutes to finish, which
+            # looks like the stop was ignored, so drop the transfer in flight instead
+            sess.job["abort"] = True
+            await say("🛑 Stopping now — giving up the file being transferred.\n"
+                      "Nothing is lost: it was not counted as copied, so it comes again "
+                      "next time you start from this point.")
+        else:
+            sess.job["stop"] = True
+            await say("🛑 Stopping after the current item…\n"
+                      "Send /stop again to give up the current file and stop right away.")
     elif sess.conv["kind"]:
         sess.reset_conv()
         await say("Cancelled. Send /copy or /create whenever you're ready.")
