@@ -1,5 +1,6 @@
 # Per-user login sessions (full account access) and runtime state — never commit
 sessions.json
+dl_sessions.json
 progress.json
 settings.json
 thumbs/

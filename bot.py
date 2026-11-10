@@ -39,7 +39,7 @@ except Exception as _e:
     fast_download = None
     FAST_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
-VERSION = "v11"
+VERSION = "v12"
 
 # Telegram moved the "list forum topics" call between API namespaces, and renamed its first
 # argument from `channel` to `peer`, so find whichever this Telethon version ships instead of
@@ -85,6 +85,9 @@ EDIT_EVERY = float(os.environ.get("EDIT_EVERY", "6"))        # seconds between l
 PROGRESS_FILE = os.environ.get("PROGRESS_FILE", "progress.json")
 SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "settings.json")
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
+# Optional second account used ONLY for downloading (see /download_account). Kept in its own
+# file so the main login file keeps exactly the same shape as before.
+DL_SESSIONS_FILE = os.environ.get("DL_SESSIONS_FILE", "dl_sessions.json")
 THUMB_DIR = os.environ.get("THUMB_DIR", "thumbs")
 # Download temp files to the app's own (large, persistent) storage, NOT the system /tmp,
 # which is tiny on many hosts and causes "No space left on device" for big videos.
@@ -104,6 +107,10 @@ PIPELINE = os.environ.get("PIPELINE", "0") == "1"
 # Parallel DOWNLOAD via FastTelethon (on by default). With sequential mode (PIPELINE=0) only one
 # transfer runs at a time, so the connection count stays low and stays stable.
 USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
+# Same switch, but for downloads that go through the separate download account. It is a
+# different Telegram account, so it has its own speed limits: an account whose parallel
+# download works can keep using it even when USE_FAST_DL is off for the main one.
+USE_FAST_DL2 = os.environ.get("USE_FAST_DL2", "1") == "1"
 # If a transfer makes no progress for this many seconds, treat the connection as dead,
 # abort that attempt and retry (so one stuck file can't freeze the copy for hours).
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
@@ -154,6 +161,11 @@ class UserSession:
         self.name = "there"
         self.client = None          # the user's own Telegram account client
         self.login_client = None     # temporary client used during /login
+        # optional second account that only downloads (its speed limits are its own)
+        self.dl_client = None
+        self.dl_name = ""
+        self.dl_src = None          # the source channel as seen by the download account
+        self.dl_dialogs_loaded = False
         self.dialogs_loaded = False
         self.chan_cache = {}        # {"all"/"admin": (timestamp, [(id, title), ...])}
         self.started_at = time.time()
@@ -172,7 +184,7 @@ class UserSession:
             rules=[], scope="both", link_rules=[],
             thumb=None, footer_text=None, footer_pos="append",
             name="", count=0,
-            phone=None, phone_code_hash=None,
+            phone=None, phone_code_hash=None, login_target="main",
             pick_src=[], pick_src_all=[], pick_src_page=0,
             pick_dst=[], pick_dst_all=[], pick_dst_page=0,
         )
@@ -190,6 +202,7 @@ class UserSession:
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, pending_kind="", paused=False, pending_id=0,
             fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False, premium=None,
+            dl_acct="", dl_acct_note="",
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
             send_block_until=0.0,
             topic_name="", topic_idx=0, topic_total=0,
@@ -230,11 +243,16 @@ def jsave(path, data):
         pass
 
 
-session_strings = jload(SESSIONS_FILE)   # {str(user_id): session_string}
+session_strings = jload(SESSIONS_FILE)        # {str(user_id): session_string}
+dl_session_strings = jload(DL_SESSIONS_FILE)  # same, for the download-only account
 
 
 def save_sessions():
     jsave(SESSIONS_FILE, session_strings)
+
+
+def save_dl_sessions():
+    jsave(DL_SESSIONS_FILE, dl_session_strings)
 
 
 def save_progress(key, last_id, count=0):
@@ -351,6 +369,41 @@ async def ensure_client(sess):
     return sess.client
 
 
+async def ensure_dl_client(sess):
+    """Connected client for the user's download-only account, or None if they haven't added one.
+    Telegram applies its download speed limit per account, so when the main account is
+    throttled this second account can do the downloading while the main one still uploads."""
+    if sess.dl_client is None:
+        ss = dl_session_strings.get(str(sess.user_id))
+        if not ss:
+            return None
+        sess.dl_client = TelegramClient(StringSession(ss), api_id, api_hash)
+        sess.dl_dialogs_loaded = False
+    try:
+        if not sess.dl_client.is_connected():
+            await sess.dl_client.connect()
+        if not await sess.dl_client.is_user_authorized():
+            sess.dl_client = None
+            dl_session_strings.pop(str(sess.user_id), None)
+            save_dl_sessions()
+            return None
+    except Exception as e:
+        print(f"Download account could not connect: {type(e).__name__}: {e}", flush=True)
+        return None
+    return sess.dl_client
+
+
+async def dl_account_name(sess):
+    if sess.dl_name:
+        return sess.dl_name
+    try:
+        me = await sess.dl_client.get_me()
+        sess.dl_name = me.first_name or "download account"
+    except Exception:
+        sess.dl_name = "download account"
+    return sess.dl_name
+
+
 async def require_login(sess):
     c = await ensure_client(sess)
     if not c:
@@ -381,6 +434,8 @@ HELP = (
     "Commands\n"
     "/login - Connect your Telegram account to the bot\n"
     "/logout - Disconnect your account\n"
+    "/download_account - Use a second account for downloading (see below)\n"
+    "/remove_download_account - Go back to downloading with your main account\n"
     "/copy - Copy content from one channel to another (guided)\n"
     "/create - Create multiple private channels (guided)\n"
     "/status - Live progress (with speed) of your current task\n"
@@ -429,6 +484,13 @@ HELP = (
     "time starting from the bottom of the list, and ask before each one. Choosing Copy sends "
     "the topic title to the destination first, then its content. Each topic keeps its own "
     "count and its own resume point. Plain channels are unaffected.\n"
+    "• Download account: Telegram applies its download speed limit per account. If your main "
+    "account is being throttled, send /download_account and log in a second (faster) account. "
+    "From then on that account downloads each file and your main account uploads it, so the "
+    "copy runs at the faster account's download speed. The second account must be a member of "
+    "the source channels; it never uploads or posts anything. If it can't see a source, the "
+    "main account downloads as before and /status says so. Remove it any time with "
+    "/remove_download_account.\n"
     "• Protected/private sources: the bot detects these and goes straight to "
     "download-and-upload mode (no wasted attempt). /status shows live download/upload "
     "percentage and speed for the current file."
@@ -721,6 +783,10 @@ def render_job():
             mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("dl_mode"), "")
             lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}{mode}: {p:.1f}% "
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job.get("dl_acct"):
+            lines.append(f"⬇️ Downloading with: {job['dl_acct']} (uploads use your main account)")
+        if job.get("dl_acct_note"):
+            lines.append(f"ℹ️ {job['dl_acct_note']}")
         if job.get("premium") is False:
             lines.append("⚠️ This account is not Premium. Telegram limits download speed for "
                          "non-Premium accounts, which also makes parallel download fail.")
@@ -1033,15 +1099,99 @@ def make_captioner(opts):
     return caption_of
 
 
+async def dl_resolve_source(dl, src, src_ref):
+    """The source channel as the download account sees it. A channel's access_hash is tied to
+    the account that fetched it, so the main account's entity object can't be reused here."""
+    tries = []
+    uname = getattr(src, "username", None)
+    if uname:
+        tries.append(uname)
+    if isinstance(src_ref, str) and src_ref not in tries:
+        tries.append(src_ref)
+    tries.append(PeerChannel(src.id))
+    for t in tries:
+        try:
+            ent = await dl.get_entity(t)
+            if ent is not None:
+                return ent
+        except Exception:
+            continue
+    # a private channel it joined may not be in this account's cache yet
+    try:
+        await dl.get_dialogs()
+        return await dl.get_entity(PeerChannel(src.id))
+    except Exception:
+        return None
+
+
+async def setup_downloader(sess, src, src_ref):
+    """Gets the download account ready for this copy. Anything that doesn't work out simply
+    leaves downloading with the main account, exactly as before: a copy never fails over this."""
+    job = sess.job
+    sess.dl_src = None
+    job["dl_acct"] = ""
+    job["dl_acct_note"] = ""
+    dl = await ensure_dl_client(sess)
+    if dl is None:
+        return
+    who = await dl_account_name(sess)
+    ent = await dl_resolve_source(dl, src, src_ref)
+    if ent is None:
+        job["dl_acct_note"] = (f"{who} can't see {title_of(src)}, so the main account is "
+                               "downloading. Join that channel with it and start again.")
+        print(f"Download account {who} cannot resolve the source channel; "
+              "using the main account for downloads.", flush=True)
+        return
+    try:
+        await dl.get_messages(ent, limit=1)
+    except Exception as e:
+        job["dl_acct_note"] = (f"{who} can't read {title_of(src)} ({type(e).__name__}), so the "
+                               "main account is downloading.")
+        print(f"Download account {who} cannot read the source: {type(e).__name__}: {e}", flush=True)
+        return
+    sess.dl_src = ent
+    job["dl_acct"] = who
+    try:
+        me = await dl.get_me()
+        print(f"Download account: {me.first_name} (id {me.id}) | "
+              f"premium={bool(getattr(me, 'premium', False))} | home DC {dl.session.dc_id} | "
+              f"parallel download={USE_FAST_DL2}", flush=True)
+    except Exception:
+        pass
+
+
+async def dl_message_for(client, m):
+    """(client, message) to download this file with. With a download account set up, that
+    account re-fetches the message itself — file references and access hashes belong to the
+    account that fetched them, so they can't be handed to another account."""
+    sess = S()
+    if sess.dl_client is None or sess.dl_src is None:
+        return client, m
+    try:
+        fresh = await sess.dl_client.get_messages(sess.dl_src, ids=m.id)
+        if fresh is not None and fresh.media is not None:
+            return sess.dl_client, fresh
+        why = "the download account sees no media there"
+    except Exception as e:
+        why = f"{type(e).__name__}: {e}"
+    sess.job["dl_acct_note"] = (f"message {m.id}: {why} — downloaded with the main account")
+    print(f"Message {m.id}: download account couldn't fetch it ({why}); "
+          "using the main account for this file.", flush=True)
+    return client, m
+
+
 async def download_one(client, m, tmp, idx, names, dcb):
     sub = os.path.join(tmp, str(idx))
     os.makedirs(sub, exist_ok=True)
+    # a separate download account has its own Telegram speed limits, so prefer it when set up
+    client, m = await dl_message_for(client, m)
+    use_fast_dl = USE_FAST_DL2 if client is S().dl_client else USE_FAST_DL
     size = getattr(getattr(m, "file", None), "size", None) or 0
     # show the download is being attempted even before the first bytes arrive
     job = S().job
     job["dl_tot"] = size
     job["dl_cur"] = 0
-    if (USE_FAST_DL and fast_download is not None and is_doc(m) and size >= FAST_MIN
+    if (use_fast_dl and fast_download is not None and is_doc(m) and size >= FAST_MIN
             and not job.get("fast_dl_off")):
         job["dl_mode"] = "fast"
         fname = names.get(m.id) or (getattr(m.file, "name", None) or f"file_{m.id}")
@@ -1084,7 +1234,7 @@ async def download_one(client, m, tmp, idx, names, dcb):
                           "switching to normal download for the rest of this task.", flush=True)
                 break
     else:
-        job["fast_note"] = f"fast download off: {why_no_fast(USE_FAST_DL, fast_download, size)}"
+        job["fast_note"] = f"fast download off: {why_no_fast(use_fast_dl, fast_download, size)}"
     job["dl_mode"] = "normal"
     if m.id in names:
         return await m.download_media(file=os.path.join(sub, names[m.id]), progress_callback=dcb)
@@ -1727,6 +1877,12 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                   f"home DC {client.session.dc_id}", flush=True)
         except Exception as e:
             print(f"Could not read account info: {type(e).__name__}: {e}", flush=True)
+        # if a download account was added, let it do the downloading (its limits are its own)
+        try:
+            await setup_downloader(sess, src, src_ref)
+        except Exception as e:
+            sess.dl_src = None
+            print(f"Download account setup skipped: {type(e).__name__}: {e}", flush=True)
         status = await say("▶️ Copy started…")
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
@@ -1761,6 +1917,7 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
                       f"{' (code ' + str(e.code) + ')' if getattr(e, 'code', None) else ''}: {e}")
     finally:
         job["running"] = False
+        sess.dl_src = None
         job["flood_until"] = 0.0
         job["dl_tot"] = job["dl_cur"] = job["ul_tot"] = job["ul_cur"] = 0
         job["dl_speed"] = job["ul_speed"] = 0.0
@@ -2329,7 +2486,28 @@ async def show_create_confirm():
 
 
 # ----------------------------- login flow -----------------------------
+async def _finish_dl_login(sess):
+    sess.dl_client = sess.login_client
+    sess.login_client = None
+    sess.dl_dialogs_loaded = False
+    sess.dl_name = ""
+    dl_session_strings[str(sess.user_id)] = sess.dl_client.session.save()
+    save_dl_sessions()
+    who = await dl_account_name(sess)
+    sess.reset_conv()
+    await say(f"✅ Download account added: {who}.\n\n"
+              "From your next /copy, this account downloads the files and your main account "
+              "uploads them. Telegram limits download speed per account, so a faster account "
+              "here means a faster copy.\n\n"
+              f"⚠️ {who} must be a member of every source channel you copy from — it is the one "
+              "fetching the files. If it can't see a source, the main account downloads instead "
+              "and /status says so.\n\n"
+              "Send /download_account to check it, or /remove_download_account to stop using it.")
+
+
 async def _finish_login(sess):
+    if sess.conv.get("login_target") == "dl":
+        return await _finish_dl_login(sess)
     sess.client = sess.login_client
     sess.login_client = None
     sess.dialogs_loaded = False
@@ -2482,7 +2660,71 @@ async def cmd_logout(arg):
     session_strings.pop(str(sess.user_id), None)
     save_sessions()
     sess.reset_conv()
-    await say("👋 Logged out. Your session has been removed from the bot.\nSend /login to connect again.")
+    extra = ("\nYour download account is still saved; send /remove_download_account to drop it too."
+             if str(sess.user_id) in dl_session_strings else "")
+    await say("👋 Logged out. Your session has been removed from the bot.\n"
+              "Send /login to connect again." + extra)
+
+
+async def cmd_download_account(arg):
+    """Add / inspect the second account that does the downloading."""
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first if you want to change the download account.")
+        return
+    if not await require_login(sess):
+        return
+    dl = await ensure_dl_client(sess)
+    if dl is not None:
+        who = await dl_account_name(sess)
+        try:
+            me = await dl.get_me()
+            prem = "yes" if getattr(me, "premium", False) else "no"
+            extra = f"\nPremium: {prem}"
+        except Exception:
+            extra = ""
+        await say(f"⬇️ Download account: {who}{extra}\n\n"
+                  "It downloads the files; your main account uploads them. It must be a member "
+                  "of every source channel you copy from.\n\n"
+                  "Send /remove_download_account to stop using it.")
+        return
+    sess.reset_conv()
+    sess.conv.update(kind="login", step="login_phone", login_target="dl")
+    await say("⬇️ Add a download account\n\n"
+              "Telegram limits download speed per account. If your main account is being "
+              "throttled, a second account can do the downloading while the main one keeps "
+              "uploading — so the copy runs at the faster account's speed.\n\n"
+              "Send that account's phone number in international format, e.g. +919876543210.\n\n"
+              "⚠️ It must be a member of the channels you copy FROM. It never uploads, never "
+              "posts and never creates anything. Send /stop to cancel.")
+
+
+async def cmd_remove_download_account(arg):
+    sess = S()
+    if sess.job["running"]:
+        await say("⚠️ A task is running. Send /stop first.")
+        return
+    had = str(sess.user_id) in dl_session_strings or sess.dl_client is not None
+    if not had:
+        await say("No download account is set. Send /download_account to add one.")
+        return
+    c = await ensure_dl_client(sess)
+    try:
+        if c:
+            await c.log_out()
+    except Exception:
+        pass
+    try:
+        if sess.dl_client and sess.dl_client.is_connected():
+            await sess.dl_client.disconnect()
+    except Exception:
+        pass
+    sess.dl_client = None
+    sess.dl_name = ""
+    sess.dl_src = None
+    dl_session_strings.pop(str(sess.user_id), None)
+    save_dl_sessions()
+    await say("✅ Download account removed. Your main account will download again.")
 
 
 async def cmd_speed(arg):
@@ -2610,6 +2852,8 @@ async def cmd_create(arg):
 
 COMMANDS = {
     "/start": cmd_start, "/help": cmd_help, "/login": cmd_login, "/logout": cmd_logout,
+    "/download_account": cmd_download_account,
+    "/remove_download_account": cmd_remove_download_account,
     "/copy": cmd_copy, "/create": cmd_create, "/status": cmd_status, "/errors": cmd_errors,
     "/speed": cmd_speed, "/stop": cmd_stop, "/cancel": cmd_stop, "/ping": cmd_ping, "/about": cmd_about,
 }
@@ -2991,6 +3235,8 @@ async def _set_command_menu():
                 BotCommand("start", "Welcome message"),
                 BotCommand("login", "Connect your Telegram account"),
                 BotCommand("logout", "Disconnect your account"),
+                BotCommand("download_account", "Use a 2nd account for downloads"),
+                BotCommand("remove_download_account", "Stop using the download account"),
                 BotCommand("copy", "Copy a channel (guided)"),
                 BotCommand("create", "Create multiple channels"),
                 BotCommand("status", "Live progress"),
@@ -3045,7 +3291,8 @@ async def main():
     logging.getLogger("telethon").setLevel(getattr(logging, LOG_LEVEL, logging.ERROR))
     bot.flood_sleep_threshold = 30
     print(f"✅ Connected. Channel Tools Assistant {VERSION} is running. Bot: @{uname}", flush=True)
-    print(f"Logged-in users remembered: {len(session_strings)}", flush=True)
+    print(f"Logged-in users remembered: {len(session_strings)} "
+          f"(download accounts: {len(dl_session_strings)})", flush=True)
     # set the command menu in the background so it can never hold up startup
     asyncio.create_task(_set_command_menu())
     print("Now listening for messages. Send /ping in the bot to test.", flush=True)
