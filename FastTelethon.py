@@ -31,6 +31,10 @@ log: logging.Logger = logging.getLogger("telethon")
 # Max parallel connections per transfer. Fewer = more stable on shared hosting
 # (too many makes Telegram drop connections). Override with FT_CONNECTIONS.
 MAX_CONNECTIONS = int(os.environ.get("FT_CONNECTIONS", "8"))
+# Telegram rate-limits downloads and uploads separately, and an account can be fine with many
+# upload connections while answering GetFileRequest with repeated short flood waits. Keeping a
+# second knob means download concurrency can be lowered without slowing uploads down.
+MAX_DL_CONNECTIONS = int(os.environ.get("FT_DL_CONNECTIONS", str(MAX_CONNECTIONS)))
 
 # Telegram allows at most 512 KB per part for both uploads and downloads. Telethon otherwise
 # picks 128 KB (files <=100 MB) or 256 KB (<=750 MB), which means 2-4x more round trips.
@@ -134,7 +138,10 @@ class ParallelTransferrer:
                         try:
                             self.senders[slot] = await self._create_sender()
                         except Exception:
-                            await asyncio.sleep(1)
+                            pass
+                        # back off a little: retrying straight away only adds to the rate
+                        # limit that caused the failure in the first place
+                        await asyncio.sleep(2 * (attempt + 1))
 
         workers = [asyncio.ensure_future(worker(i)) for i in range(connections)]
         try:
@@ -277,7 +284,8 @@ async def download_file(client: TelegramClient,
     # transfer at a time per client avoids "server closed the connection" errors.
     async with parallel_transfer_locks[("dl", id(client))]:
         downloader = ParallelTransferrer(client, dc_id)
-        connections = max(1, min(downloader._get_connection_count(size), part_count))
+        connections = max(1, min(downloader._get_connection_count(size, MAX_DL_CONNECTIONS),
+                                 part_count))
         await downloader.init_senders(connections)
         log.debug(f"Starting parallel download: {connections} {part_size} {part_count}")
 
