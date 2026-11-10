@@ -111,6 +111,10 @@ USE_FAST_DL = os.environ.get("USE_FAST_DL", "1") == "1"
 # different Telegram account, so it has its own speed limits: an account whose parallel
 # download works can keep using it even when USE_FAST_DL is off for the main one.
 USE_FAST_DL2 = os.environ.get("USE_FAST_DL2", "1") == "1"
+# USE_DL_ACCOUNT=0 keeps the download account logged in but stops using it, so the main
+# account's own download speed can be measured against it without logging anything out
+# (a logout means re-logging in with an SMS code, which Telegram rate-limits).
+USE_DL_ACCOUNT = os.environ.get("USE_DL_ACCOUNT", "1") == "1"
 # If a transfer makes no progress for this many seconds, treat the connection as dead,
 # abort that attempt and retry (so one stuck file can't freeze the copy for hours).
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "180"))
@@ -1131,6 +1135,13 @@ async def setup_downloader(sess, src, src_ref):
     sess.dl_src = None
     job["dl_acct"] = ""
     job["dl_acct_note"] = ""
+    if not USE_DL_ACCOUNT:
+        if str(sess.user_id) in dl_session_strings:
+            job["dl_acct_note"] = ("download account switched off (USE_DL_ACCOUNT=0); "
+                                   "the main account is downloading")
+            print("Download account is switched off by USE_DL_ACCOUNT=0; "
+                  "using the main account for downloads.", flush=True)
+        return
     dl = await ensure_dl_client(sess)
     if dl is None:
         return
@@ -2683,9 +2694,12 @@ async def cmd_download_account(arg):
             extra = f"\nPremium: {prem}"
         except Exception:
             extra = ""
+        off = ("\n\n⚠️ It is switched off right now (USE_DL_ACCOUNT=0), so your main account is "
+               "downloading. The login is kept, so switching it back on needs no new code."
+               if not USE_DL_ACCOUNT else "")
         await say(f"⬇️ Download account: {who}{extra}\n\n"
                   "It downloads the files; your main account uploads them. It must be a member "
-                  "of every source channel you copy from.\n\n"
+                  "of every source channel you copy from." + off + "\n\n"
                   "Send /remove_download_account to stop using it.")
         return
     sess.reset_conv()

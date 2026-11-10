@@ -45,6 +45,7 @@ bot. This version removes that: anyone can log in and use it with their own acco
 | `USE_FAST` | no | `1` | Parallel multi-connection **upload** (fast uploads). Set `0` to disable |
 | `USE_FAST_DL` | no | `1` | Parallel **download** via FastTelethon. Set `0` for plain download |
 | `USE_FAST_DL2` | no | `1` | Same, but for the separate download account (its speed limits are its own) |
+| `USE_DL_ACCOUNT` | no | `1` | `0` keeps the download account logged in but stops using it, so the two accounts' download speeds can be compared without logging out |
 | `STALL_SECONDS` | no | `180` | Abort and retry a transfer if it makes no progress for this long (dead connection) |
 | `PIPELINE` | no | `0` | `1` = overlap download+upload (~2x, more connections). `0` = one at a time (stable) |
 | `FAST_UPLOAD_MB` | no | `5` | When `USE_FAST=1`, files larger than this use parallel transfer |
@@ -93,6 +94,9 @@ use the main account.
   fails or skips content because of this.
 - `/download_account` again shows which account is in use (and whether it is
   Premium); `/remove_download_account` goes back to one account.
+- To compare the two accounts' download speed, set `USE_DL_ACCOUNT=0` and restart:
+  the login is kept but the main account does the downloading. Telegram rate-limits
+  logins, so this avoids logging out and back in for a measurement.
 - Message objects can't be shared between accounts (file references and access
   hashes belong to the account that fetched them), so the download account
   re-fetches each message by ID from its own view of the channel.
