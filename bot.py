@@ -189,7 +189,7 @@ class UserSession:
             dl_cur=0, dl_tot=0, dl_speed=0.0, dl_no=0,
             ul_cur=0, ul_tot=0, ul_speed=0.0, ul_no=0,
             pending=None, pending_kind="", paused=False, pending_id=0,
-            fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False,
+            fast_note="", refresh_refs=False, fast_dl_fails=0, fast_dl_off=False, premium=None,
             base_done=0, status_msg=None, edit_fails=0, edit_block_until=0.0, last_text="",
             send_block_until=0.0,
             topic_name="", topic_idx=0, topic_total=0,
@@ -721,6 +721,9 @@ def render_job():
             mode = {"fast": " ⚡fast", "normal": " (normal)"}.get(job.get("dl_mode"), "")
             lines.append(f"⬇️ Downloading #{job['dl_no']}{tc}{mode}: {p:.1f}% "
                          f"({fmt_size(job['dl_cur'])} / {fmt_size(job['dl_tot'])}){sp}")
+        if job.get("premium") is False:
+            lines.append("⚠️ This account is not Premium. Telegram limits download speed for "
+                         "non-Premium accounts, which also makes parallel download fail.")
         if job.get("fast_note"):
             lines.append(f"⚠️ {job['fast_note']}")
         if job.get("paused"):
@@ -1714,6 +1717,16 @@ async def run_copy(src_ref, dst_ref, min_id, opts):
         # protected/private source: skip the pointless direct-copy attempt, download+upload directly
         if getattr(src, "noforwards", False):
             job["force_dl"] = True
+        # Telegram throttles downloads for accounts without Premium by answering GetFileRequest
+        # with repeated short flood waits, which looks exactly like a broken parallel download.
+        # Record it once so the cause is visible instead of guessed at.
+        try:
+            me = await client.get_me()
+            job["premium"] = bool(getattr(me, "premium", False))
+            print(f"Account: {me.first_name} (id {me.id}) | premium={job['premium']} | "
+                  f"home DC {client.session.dc_id}", flush=True)
+        except Exception as e:
+            print(f"Could not read account info: {type(e).__name__}: {e}", flush=True)
         status = await say("▶️ Copy started…")
         await refresh(status, force=True)
         ticker_task = asyncio.create_task(progress_ticker())
