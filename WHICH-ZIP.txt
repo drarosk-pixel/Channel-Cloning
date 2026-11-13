@@ -1,0 +1,35 @@
+Which zip is which
+==================
+
+Channel-Cloning-OLD-stable-v11.zip
+  Branch: stable-old-bot   Commit: 18210d1   VERSION = v11
+  The old, proven bot. This is what runs on the old server (103.235.106.58).
+  Do not change it: it has been copying at 6-7 MB/s for days.
+
+Channel-Cloning-NEW-v14.zip
+  Branch: new-bot          Commit: 38f885e   VERSION = v14
+  The newer bot with today's fixes: worker-pool download and upload,
+  topic-group flow with per-topic progress and resume, manual retry/skip/stop,
+  flood auto-resume, a clean break between one task and the next, and /stop
+  twice to drop the transfer in flight.
+
+Channel Cloning Assistant.zip
+  Same code as Channel-Cloning-OLD-stable-v11.zip. Kept under this exact name
+  because the old server's update command downloads this file; renaming or
+  repointing it would break that command.
+
+Installing from a zip
+---------------------
+Both zips hold the files at the top level (no folder inside), so unzip them
+straight into the bot's directory:
+
+  cd /root/Channel-Cloning
+  wget -O bot.zip "<link>"
+  unzip -o bot.zip
+  systemctl restart bot
+
+Your own data is not in the zip and is not touched by unzip -o:
+sessions.json, progress.json, settings.json, thumbs/ and dl_tmp/ stay as they
+are. Check the version after restarting:
+
+  grep '^VERSION' bot.py
